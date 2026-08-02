@@ -35,6 +35,8 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\build-native.ps1 -Cuda
 
 The script automatically detects your Visual Studio environment and Ninja if installed. It will copy the resulting DLLs to the root directory for use by the application.
 
+Pass `-PortableCpu` to build with the same AVX2 baseline used by Windows packages. Developer builds otherwise retain GGML's native CPU optimization.
+
 ### Linux
 
 **Build for CPU:**
@@ -122,6 +124,8 @@ The script resolves a JDK for JNI headers, loads the Visual Studio build environ
 
 ### `scripts/package-windows.ps1` (Windows)
 This script automates the entire process: it rebuilds the native backend, calls Gradle to create the app image, and bundles the native libraries and assets into a final package. CUDA runtime DLLs are only included when `-BundleCudaRuntime` is passed.
+
+Packaged Windows builds use an AVX2 CPU baseline and explicitly disable AVX-512 so the binaries do not inherit the GitHub runner's CPU instruction set. AVX2 is therefore the minimum CPU requirement for Windows packages.
 
 ## Troubleshooting
 

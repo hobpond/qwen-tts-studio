@@ -219,6 +219,7 @@ if (-not $SkipNativeBuild) {
     $nativeBuildArgs = @{
         Configuration = $Configuration
         CopyToRoot = $true
+        PortableCpu = $true
     }
     if ($Cuda) {
         $nativeBuildArgs.Cuda = $true

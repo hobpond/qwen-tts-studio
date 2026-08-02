@@ -4,6 +4,7 @@ param(
     [switch]$CopyToRoot = $true,
     [switch]$Cuda,
     [string]$CudaArchitectures,
+    [switch]$PortableCpu,
     [switch]$UseNinja,
     [switch]$Clean
 )
@@ -106,7 +107,8 @@ $ExternalDir = Join-Path $RepoRoot "external"
 $hasNinja = $null -ne (Get-Command ninja -ErrorAction SilentlyContinue)
 $generator = if ($UseNinja -or $hasNinja) { "Ninja" } else { $null }
 $generatorSuffix = if ($generator) { "ninja" } else { "msvc" }
-$BuildDirName = if ($Cuda) { "build-cuda-$generatorSuffix" } else { "build-$generatorSuffix" }
+$buildFlavorSuffix = if ($PortableCpu) { "-portable" } else { "" }
+$BuildDirName = if ($Cuda) { "build-cuda-$generatorSuffix$buildFlavorSuffix" } else { "build-$generatorSuffix$buildFlavorSuffix" }
 $BuildDir = Join-Path $ExternalDir $BuildDirName
 if ($Clean -and (Test-Path $BuildDir)) {
     Write-Host "Cleaning build directory: $BuildDir" -ForegroundColor Cyan
@@ -154,6 +156,21 @@ if ($generator) {
     $cmakeArgs += @("-A", $Platform)
     Write-Host "Using CMake generator: Visual Studio ($Platform)" -ForegroundColor DarkCyan
 }
+if ($PortableCpu) {
+    $cmakeArgs += @(
+        "-DGGML_NATIVE=OFF",
+        "-DGGML_SSE42=ON",
+        "-DGGML_AVX=ON",
+        "-DGGML_AVX2=ON",
+        "-DGGML_BMI2=ON",
+        "-DGGML_AVX_VNNI=OFF",
+        "-DGGML_AVX512=OFF",
+        "-DGGML_AVX512_VBMI=OFF",
+        "-DGGML_AVX512_VNNI=OFF",
+        "-DGGML_AVX512_BF16=OFF"
+    )
+    Write-Host "Using portable AVX2 CPU baseline (AVX-512 disabled)." -ForegroundColor DarkCyan
+}
 if ($Cuda) {
     $cmakeArgs += @("-DQWEN3_TTS_CUDA=ON", "-DGGML_CUDA=ON")
     if ([string]::IsNullOrWhiteSpace($CudaArchitectures)) {
@@ -171,6 +188,34 @@ if ($Cuda) {
 cmake @cmakeArgs
 if ($LASTEXITCODE -ne 0) {
     throw "CMake configure failed with exit code $LASTEXITCODE"
+}
+
+if ($PortableCpu) {
+    $cachePath = Join-Path $BuildDir "CMakeCache.txt"
+    $cacheContent = Get-Content -Raw -LiteralPath $cachePath
+    $requiredCacheEntries = @(
+        "GGML_NATIVE:BOOL=OFF",
+        "GGML_AVX2:BOOL=ON",
+        "GGML_AVX512:BOOL=OFF",
+        "GGML_AVX512_VBMI:BOOL=OFF",
+        "GGML_AVX512_VNNI:BOOL=OFF",
+        "GGML_AVX512_BF16:BOOL=OFF"
+    )
+    foreach ($entry in $requiredCacheEntries) {
+        if ($cacheContent -notmatch "(?m)^$([regex]::Escape($entry))\r?$") {
+            throw "Portable CPU configuration check failed: expected '$entry' in $cachePath"
+        }
+    }
+
+    if ($generator) {
+        $ninjaPath = Join-Path $BuildDir "build.ninja"
+        if (Select-String -LiteralPath $ninjaPath -Pattern '^\s*(FLAGS|DEFINES) = .*?(?:/arch:AVX512|-DGGML_AVX512)' -Quiet) {
+            throw "Portable CPU configuration check failed: AVX-512 compile flags found in $ninjaPath"
+        }
+        if (-not (Select-String -LiteralPath $ninjaPath -Pattern '^\s*FLAGS = .*/arch:AVX2' -Quiet)) {
+            throw "Portable CPU configuration check failed: AVX2 compile flags not found in $ninjaPath"
+        }
+    }
 }
 
 Write-Host "Building native JNI library..." -ForegroundColor Cyan
@@ -241,4 +286,3 @@ if ($CopyToRoot) {
 }
 
 Write-Host "Native build complete." -ForegroundColor Green
-
