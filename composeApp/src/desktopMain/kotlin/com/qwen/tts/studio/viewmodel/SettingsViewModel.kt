@@ -313,7 +313,10 @@ class SettingsViewModel : ViewModel() {
      * @param path The new app data directory path.
      */
     fun setAppDir(path: String) {
-        _appDir.value = path
+        val normalizedPath = path.trim()
+        if (normalizedPath.isEmpty() || normalizedPath == _appDir.value) return
+
+        _appDir.value = normalizedPath
         saveAll()
     }
 

@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
@@ -43,6 +45,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qwen.tts.studio.viewmodel.ModelDownloadOption
@@ -175,6 +178,13 @@ fun SetupScreen(viewModel: SettingsViewModel) {
 @Composable
 private fun AppDirectorySection(viewModel: SettingsViewModel) {
     val appDir by viewModel.appDir.collectAsState()
+    var appDirInput by remember(appDir) { mutableStateOf(appDir) }
+    val saveAppDir = {
+        val path = appDirInput.trim()
+        if (path.isNotEmpty() && path != appDir) {
+            viewModel.setAppDir(path)
+        }
+    }
     val launcher = rememberDirectoryPickerLauncher(title = "Select App Data Directory") { directory ->
         directory?.path?.let { viewModel.setAppDir(it) }
     }
@@ -188,13 +198,23 @@ private fun AppDirectorySection(viewModel: SettingsViewModel) {
         )
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             OutlinedTextField(
-                value = appDir,
-                onValueChange = { viewModel.setAppDir(it) },
+                value = appDirInput,
+                onValueChange = { appDirInput = it },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
                 placeholder = { Text("Select folder...") },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { saveAppDir() }),
                 shape = MaterialTheme.shapes.medium
             )
+            OutlinedButton(
+                onClick = saveAppDir,
+                enabled = appDirInput.trim().let { it.isNotEmpty() && it != appDir },
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.height(56.dp)
+            ) {
+                Text("Save")
+            }
             Button(
                 onClick = { launcher.launch() },
                 shape = MaterialTheme.shapes.medium,
