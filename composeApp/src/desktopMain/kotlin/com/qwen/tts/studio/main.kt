@@ -2,13 +2,16 @@ package com.qwen.tts.studio
 
 import androidx.compose.runtime.*
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import java.awt.Color
+import java.awt.Dimension
 import java.awt.Window as AwtWindow
 import javax.swing.SwingUtilities
+import kotlin.math.roundToInt
 
 /**
  * The main entry point for the desktop application.
@@ -16,7 +19,7 @@ import javax.swing.SwingUtilities
  */
 fun main() = application {
     var isDarkMode by remember { mutableStateOf(true) }
-    val windowState = rememberWindowState(width = 1440.dp, height = 920.dp)
+    val windowState = rememberWindowState(width = 1440.dp, height = 1000.dp)
 
     Window(
         onCloseRequest = ::exitApplication,
@@ -24,6 +27,15 @@ fun main() = application {
         icon = painterResource("icons/app-icon.svg"),
         state = windowState,
     ) {
+        val density = LocalDensity.current
+        LaunchedEffect(density) {
+            // Keep the full Studio action area usable at startup and during resize.
+            // Convert from dp so the minimum remains consistent on scaled Windows displays.
+            window.minimumSize = with(density) {
+                Dimension(1200.dp.toPx().roundToInt(), 900.dp.toPx().roundToInt())
+            }
+        }
+
         // Apply dark title bar if possible (Windows 10/11)
         val window = window
         LaunchedEffect(isDarkMode) {

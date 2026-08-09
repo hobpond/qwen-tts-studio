@@ -40,9 +40,11 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -73,6 +75,7 @@ import com.qwen.tts.studio.viewmodel.StudioViewModel
 import com.qwen.tts.studio.viewmodel.VoiceCloneMode
 import com.qwen.tts.studio.viewmodel.VoicesViewModel
 import io.github.vinceglb.filekit.compose.rememberFileSaverLauncher
+import java.io.File
 
 /**
  * The main screen for audio synthesis.
@@ -86,7 +89,7 @@ import io.github.vinceglb.filekit.compose.rememberFileSaverLauncher
 fun StudioScreen(
     viewModel: StudioViewModel,
     settingsViewModel: SettingsViewModel,
-    voicesViewModel: VoicesViewModel
+    voicesViewModel: VoicesViewModel,
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val modelDir by settingsViewModel.modelDir.collectAsState()
@@ -96,7 +99,6 @@ fun StudioScreen(
     val voices by voicesViewModel.voices.collectAsState()
     val isCreatingVoice by voicesViewModel.isCreating.collectAsState()
     val selectedVoicePreset = voices.firstOrNull { it.name == uiState.selectedVoice }
-
     val saverLauncher = rememberFileSaverLauncher { file ->
         file?.path?.let { viewModel.saveAudioToFile(java.io.File(it)) }
     }
@@ -388,7 +390,7 @@ fun StudioScreen(
 
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
@@ -512,22 +514,27 @@ fun StudioScreen(
                         }
                     }
 
-                    Button(
-                        onClick = { viewModel.generateAudio(modelDir, modelName, speakerEmbeddingPath, iclPromptPath, backendPreference) },
-                        enabled = uiState.text.isNotBlank() &&
-                            !uiState.isGenerating &&
-                            !missingSpeakerEmbedding &&
-                            !missingIclPrompt,
-                        contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        if (uiState.isGenerating) {
-                            CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
-                            Spacer(Modifier.width(12.dp))
-                            Text(if (uiState.useStreaming) "Streaming..." else "Processing...")
-                        } else {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(if (uiState.useStreaming) "Stream Aloud" else "Read Aloud")
+                        Button(
+                            onClick = { viewModel.generateAudio(modelDir, modelName, speakerEmbeddingPath, iclPromptPath, backendPreference) },
+                            enabled = uiState.text.isNotBlank() &&
+                                !uiState.isGenerating &&
+                                !missingSpeakerEmbedding &&
+                                !missingIclPrompt,
+                            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp)
+                        ) {
+                            if (uiState.isGenerating) {
+                                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onPrimary)
+                                Spacer(Modifier.width(12.dp))
+                                Text(if (uiState.useStreaming) "Streaming..." else "Processing...")
+                            } else {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(if (uiState.useStreaming) "Stream Aloud" else "Read Aloud")
+                            }
                         }
                     }
                 }

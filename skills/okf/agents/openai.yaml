@@ -1,0 +1,7 @@
+interface:
+  display_name: "Open Knowledge Format"
+  short_description: "Author and validate linked OKF knowledge bundles"
+  default_prompt: "Use $okf to update or validate this repository's Open Knowledge Format bundle."
+
+policy:
+  allow_implicit_invocation: true

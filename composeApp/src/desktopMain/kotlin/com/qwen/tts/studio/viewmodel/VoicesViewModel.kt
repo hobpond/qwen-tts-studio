@@ -293,7 +293,8 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
         referenceText: String?,
         modelDir: String,
         modelName: String?,
-        backendPreference: NativeBackendPreference
+        backendPreference: NativeBackendPreference,
+        onCreated: ((VoicePreset) -> Unit)? = null
     ) {
         val wavFile = File(referenceWav)
         if (!wavFile.exists() || !wavFile.isFile) {
@@ -318,9 +319,19 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
         val voiceId = "voice-${System.currentTimeMillis()}"
         val trimmedReferenceText = referenceText?.trim().orEmpty()
         viewModelScope.launch {
+            var managedReferenceWav: File? = null
             try {
+                managedReferenceWav = withContext(Dispatchers.IO) {
+                    recordingsDirectory().apply { mkdirs() }
+                        .resolve("$voiceId.wav")
+                        .also { target ->
+                            Files.copy(wavFile.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                        }
+                }
+                val extractionWav = managedReferenceWav
                 val targetModels = withContext(Dispatchers.IO) { findEmbeddingTargetModels(modelDir, modelName) }
                 if (targetModels.isEmpty()) {
+                    managedReferenceWav.delete()
                     _error.value = "No qwen-talker GGUF model found for speaker embedding extraction."
                     return@launch
                 }
@@ -370,7 +381,7 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
                     if (!extractedEmbeddings.containsKey(embeddingDim)) {
                         val embeddingFile = File(embeddingsDir, "$voiceId-d$embeddingDim.json")
                         val extraction = withContext(nativeDispatcher) {
-                            qwenEngine.extractSpeakerEmbeddingDetailed(wavFile.absolutePath, embeddingFile.absolutePath)
+                            qwenEngine.extractSpeakerEmbeddingDetailed(extractionWav.absolutePath, embeddingFile.absolutePath)
                         }
                         if (!extraction.success) {
                             deleteEmbeddingFiles(listOf(embeddingFile.absolutePath))
@@ -394,7 +405,7 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
                             continue
                         }
                         val iclExtraction = withContext(nativeDispatcher) {
-                            qwenEngine.extractIclPromptDetailed(wavFile.absolutePath, trimmedReferenceText, iclPromptFile.absolutePath)
+                            qwenEngine.extractIclPromptDetailed(extractionWav.absolutePath, trimmedReferenceText, iclPromptFile.absolutePath)
                         }
                         if (!iclExtraction.success) {
                             deleteIclPromptFiles(extractedIclPrompts.values + iclPromptFile.absolutePath)
@@ -406,6 +417,7 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
                 }
 
                 if (extractedEmbeddings.isEmpty() && extractedIclPrompts.isEmpty()) {
+                    managedReferenceWav.delete()
                     _supportsCloning.value = lastSupportsCloning
                     _currentEmbeddingDim.value = lastEmbeddingDim
                     _error.value = extractionErrors.firstOrNull()
@@ -416,7 +428,7 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
                 val preset = VoicePreset(
                     id = voiceId,
                     name = uniqueName,
-                    referenceWav = wavFile.absolutePath,
+                    referenceWav = extractionWav.absolutePath,
                     referenceText = trimmedReferenceText.ifBlank { null },
                     speakerEmbeddings = extractedEmbeddings,
                     iclPrompts = extractedIclPrompts
@@ -426,6 +438,10 @@ class VoicesViewModel(initialAppDir: String = defaultAppDirectory().absolutePath
                 _error.value = iclPromptWarning ?: extractionErrors.firstOrNull()?.let {
                     "Speaker preset created, but $it"
                 }
+                onCreated?.invoke(preset)
+            } catch (error: Throwable) {
+                managedReferenceWav?.delete()
+                _error.value = "Could not save speaker preset: ${error.message ?: "unknown error"}"
             } finally {
                 _isCreating.value = false
             }

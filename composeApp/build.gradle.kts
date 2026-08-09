@@ -21,6 +21,7 @@ kotlin {
 
     sourceSets {
         val desktopMain = getByName("desktopMain")
+        val desktopTest = getByName("desktopTest")
         val commonTest = getByName("commonTest")
 
         commonMain.dependencies {
@@ -37,6 +38,10 @@ kotlin {
         }
 
         commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+
+        desktopTest.dependencies {
             implementation(kotlin("test"))
         }
         

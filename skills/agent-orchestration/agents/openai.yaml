@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Orchestration"
+  short_description: "Plan and coordinate bounded agent work"
+  default_prompt: "Use $agent-orchestration to plan and coordinate this multi-agent task."

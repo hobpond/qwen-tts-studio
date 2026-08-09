@@ -133,3 +133,13 @@ Packaged Windows builds use an AVX2 CPU baseline and explicitly disable AVX-512 
 - **CUDA Errors:** Ensure the `CUDA_PATH` environment variable is set so the build script can find the CUDA toolkit.
 - **`UnsatisfiedLinkError` for a new native method:** Rebuild the native backend and restart the app. On Windows, run `.\scripts\run-compose.ps1 -Cuda -BuildNative` or `pwsh -ExecutionPolicy Bypass -File .\scripts\build-native.ps1 -Cuda`. The JVM cannot reload an already-loaded DLL inside the same app process.
 - **Submodules Not Found:** If `external/qwen3-tts-cpp` is empty, run `git submodule update --init --recursive`.
+
+### Portable batch smoke test
+
+After building the portable app, prepare an isolated two-line UTF-8 fixture and verify the model prerequisite with:
+
+```powershell
+.\scripts\smoke-batch-portable.ps1
+```
+
+Pass `-Launch` after a GGUF model is available to launch the portable UI. Select the reported `batch-input.txt` and output directory in the Batch generation panel. A successful run produces `manifest.json`, `chunk-000000.wav`, and `chunk-000001.wav`; use **Recombine WAV** to create the combined output. The helper exits with code `2` when no GGUF file is found, so preparation is not mistaken for inference verification.

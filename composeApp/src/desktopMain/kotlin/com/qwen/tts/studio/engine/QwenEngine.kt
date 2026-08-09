@@ -15,6 +15,12 @@ enum class NativeBackendPreference(val id: String, val label: String) {
     }
 }
 
+enum class QwenEngineExecutionMode {
+    Unloaded,
+    Native,
+    CliFallback
+}
+
 /**
  * High-level wrapper for the Qwen3 Engine using JNI.
  * This class handles native library loading, model initialization, and audio synthesis.
@@ -42,6 +48,8 @@ class QwenEngine {
         val errorMsg: String?,
         val timeMs: Long
     )
+
+    data class BackendMemory(val freeBytes: Long, val totalBytes: Long)
 
     /**
      * Parameters for the synthesis operation.
@@ -89,6 +97,31 @@ class QwenEngine {
         val success: Boolean,
         val errorMsg: String? = null
     )
+
+    /**
+     * The engine is reusable for buffered requests only when this is Native.
+     * CLI fallback starts a new process for every request and cannot provide a
+     * one-loaded-session guarantee.
+     */
+    fun executionMode(): QwenEngineExecutionMode = when {
+        nativePtr != 0L -> QwenEngineExecutionMode.Native
+        useCliFallback && loadedModelDir != null -> QwenEngineExecutionMode.CliFallback
+        else -> QwenEngineExecutionMode.Unloaded
+    }
+
+    fun isLoaded(): Boolean = executionMode() != QwenEngineExecutionMode.Unloaded
+
+    fun supportsReusableBufferedSession(): Boolean =
+        executionMode() == QwenEngineExecutionMode.Native
+
+    /** Returns active backend memory when the native build exposes it. */
+    fun backendMemory(): BackendMemory? {
+        if (nativePtr == 0L) return null
+        return runCatching {
+            nativeGetBackendMemory()?.takeIf { it.size >= 2 && it[1] > 0L }
+                ?.let { BackendMemory(it[0].coerceAtLeast(0L), it[1]) }
+        }.getOrNull()
+    }
 
     interface StreamingAudioCallback {
         fun onAudioChunk(
@@ -221,7 +254,7 @@ class QwenEngine {
                 )
         }
 
-        private fun ensureNativeLoaded() {
+        internal fun ensureNativeLibrary() {
             synchronized(loadLock) {
                 if (isNativeLoaded) return
                 try {
@@ -397,6 +430,7 @@ class QwenEngine {
     private external fun nativeSetBackendPreference(preference: Int): Boolean
     private external fun nativeGetCompiledBackendMask(): Int
     private external fun nativeGetActiveBackendName(): String?
+    private external fun nativeGetBackendMemory(): LongArray?
     private external fun nativeSynthesize(
         ptr: Long,
         text: String,
@@ -467,7 +501,7 @@ class QwenEngine {
         loadedModelName = modelName
         useCliFallback = false
 
-        ensureNativeLoaded()
+        ensureNativeLibrary()
         
         if (!isNativeLoaded) {
             return enableCliFallbackOrFailure(
@@ -538,7 +572,7 @@ class QwenEngine {
         loadedModelName = modelName
         useCliFallback = false
 
-        ensureNativeLoaded()
+        ensureNativeLibrary()
 
         if (!isNativeLoaded) {
             return enableCliFallbackOrFailure(
@@ -614,14 +648,47 @@ class QwenEngine {
         instruction: String? = null,
         speaker: String? = null
     ): FloatArray? {
+        return generateDetailed(
+            text, referenceWav, speakerEmbeddingPath, iclPromptPath,
+            languageId, instruction, speaker
+        )?.takeIf { it.success }?.audio
+    }
+
+    /**
+     * Synthesizes one buffered request using the already loaded engine.
+     * This method never loads or releases an engine, so callers can issue
+     * sequential requests under one explicit native load. The returned
+     * sampleRate is the value reported by native synthesis (or the WAV header
+     * in CLI fallback mode).
+     */
+    fun generateDetailed(
+        text: String,
+        referenceWav: String? = null,
+        speakerEmbeddingPath: String? = null,
+        iclPromptPath: String? = null,
+        languageId: Int = 2050,
+        instruction: String? = null,
+        speaker: String? = null,
+        maxAudioTokens: Int = NativeParams().maxAudioTokens
+    ): NativeResult {
         if (useCliFallback) {
-            return generateViaCli(text, referenceWav, speakerEmbeddingPath, iclPromptPath, languageId, instruction, speaker)
+            val cliResult = generateViaCli(
+                text, referenceWav, speakerEmbeddingPath, iclPromptPath,
+                languageId, instruction, speaker
+            )
+            return if (cliResult != null) {
+                NativeResult(cliResult.audio, cliResult.sampleRate, true, null, 0L)
+            } else {
+                NativeResult(null, 0, false, "CLI fallback synthesis failed.", 0L)
+            }
         }
 
-        if (nativePtr == 0L) return null
+        if (nativePtr == 0L) {
+            return NativeResult(null, 0, false, "Native engine is not loaded.", 0L)
+        }
 
         return try {
-            val params = NativeParams(languageId = languageId, instruction = instruction, speaker = speaker)
+            val params = NativeParams(languageId = languageId, instruction = instruction, speaker = speaker, maxAudioTokens = maxAudioTokens.coerceAtLeast(1))
             val result = try {
                 if (!iclPromptPath.isNullOrBlank()) {
                     nativeSynthesizeWithIclPrompt(nativePtr, text, iclPromptPath, params)
@@ -629,20 +696,17 @@ class QwenEngine {
                     nativeSynthesize(nativePtr, text, referenceWav, speakerEmbeddingPath, params)
                 }
             } catch (e: UnsatisfiedLinkError) {
-                System.err.println("[QwenEngine] ICL prompt synthesis JNI is unavailable. Rebuild qwen3_tts.dll after updating qwen3-tts.cpp: ${e.message}")
-                null
+                val message = "ICL prompt synthesis JNI is unavailable. Rebuild qwen3_tts.dll after updating qwen3-tts.cpp: ${e.message}"
+                System.err.println("[QwenEngine] $message")
+                NativeResult(null, 0, false, message, 0L)
             }
-            if (result != null && result.success) {
-                result.audio
-            } else {
-                if (result != null) {
-                    System.err.println("[QwenEngine] Native synthesis failed: ${result.errorMsg}")
-                }
-                null
+            if (result != null && !result.success) {
+                System.err.println("[QwenEngine] Native synthesis failed: ${result.errorMsg}")
             }
+            result ?: NativeResult(null, 0, false, "Native synthesis returned no result.", 0L)
         } catch (e: Throwable) {
             e.printStackTrace()
-            null
+            NativeResult(null, 0, false, e.message ?: e::class.simpleName, 0L)
         }
     }
 
@@ -658,11 +722,11 @@ class QwenEngine {
         onAudioChunk: (NativeAudioChunk) -> Boolean
     ): NativeResult? {
         if (useCliFallback) {
-            val audio = generateViaCli(text, referenceWav, speakerEmbeddingPath, iclPromptPath, languageId, instruction, speaker)
-            return if (audio != null) {
-                NativeResult(audio, 24_000, true, null, 0L)
+            val cliResult = generateViaCli(text, referenceWav, speakerEmbeddingPath, iclPromptPath, languageId, instruction, speaker)
+            return if (cliResult != null) {
+                NativeResult(cliResult.audio, cliResult.sampleRate, true, null, 0L)
             } else {
-                NativeResult(null, 24_000, false, "Streaming is unavailable in CLI fallback mode.", 0L)
+                NativeResult(null, 0, false, "Streaming is unavailable in CLI fallback mode.", 0L)
             }
         }
 
@@ -732,7 +796,7 @@ class QwenEngine {
     }
 
     fun compiledBackendMask(): Int {
-        ensureNativeLoaded()
+        ensureNativeLibrary()
         return if (isNativeLoaded) nativeGetCompiledBackendMask() else BACKEND_CPU
     }
 
@@ -850,6 +914,8 @@ class QwenEngine {
         }
     }
 
+    private data class CliAudioResult(val audio: FloatArray, val sampleRate: Int)
+
     private fun generateViaCli(
         text: String,
         referenceWav: String?,
@@ -858,7 +924,7 @@ class QwenEngine {
         languageId: Int,
         instruction: String?,
         speaker: String?
-    ): FloatArray? {
+    ): CliAudioResult? {
         val modelDir = loadedModelDir ?: return null
         val root = try { resolveNativeRoot() } catch (e: Exception) { File(".") }
         val cliExe = resolveCliExe(root) ?: return null
@@ -1005,8 +1071,9 @@ class QwenEngine {
         )
     }
 
-    private fun readWavToFloatArray(file: File): FloatArray {
+    private fun readWavToFloatArray(file: File): CliAudioResult {
         AudioSystem.getAudioInputStream(file).use { input ->
+            val sampleRate = input.format.sampleRate.toInt()
             val targetFormat = AudioFormat(
                 AudioFormat.Encoding.PCM_SIGNED,
                 input.format.sampleRate,
@@ -1028,7 +1095,10 @@ class QwenEngine {
                     samples[j++] = (v.toShort() / 32768.0f)
                     i += 2
                 }
-                return if (j == samples.size) samples else samples.copyOf(j)
+                return CliAudioResult(
+                    if (j == samples.size) samples else samples.copyOf(j),
+                    sampleRate
+                )
             }
         }
     }

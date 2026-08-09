@@ -46,11 +46,17 @@ set_target_properties(qwen3_tts_shared PROPERTIES
 target_include_directories(qwen3_tts_shared PRIVATE 
     qwen3-tts-cpp/src
     qwen3-tts-cpp/ggml/include
+    qwen3-asr-cpp/include
+    qwen3-asr-cpp/src
     ${JNI_INCLUDE_DIRS}
 )
 
 # Link against the static library produced by the submodule
 target_link_libraries(qwen3_tts_shared PRIVATE qwen3_tts ${JNI_LIBRARIES})
+if(TARGET qwen3_asr)
+    target_link_libraries(qwen3_tts_shared PRIVATE qwen3_asr)
+    target_compile_definitions(qwen3_tts_shared PRIVATE QWEN3_TTS_ASR_ENABLED)
+endif()
 
 # Export symbols for Windows
 if(WIN32)

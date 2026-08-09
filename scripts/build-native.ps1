@@ -6,7 +6,8 @@ param(
     [string]$CudaArchitectures,
     [switch]$PortableCpu,
     [switch]$UseNinja,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$NoCopyToRoot
 )
 
 $ErrorActionPreference = "Stop"
@@ -278,7 +279,7 @@ if ($Cuda) {
     }
 }
 
-if ($CopyToRoot) {
+if ($CopyToRoot -and -not $NoCopyToRoot) {
     Write-Host "Copying native DLLs to repository root..." -ForegroundColor Cyan
     foreach ($f in ($NativeFiles + $OptionalNativeFiles)) {
         Copy-Item $f $RepoRoot -Force

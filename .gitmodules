@@ -1,4 +1,8 @@
 [submodule "external/qwen3-tts-cpp"]
 	path = external/qwen3-tts-cpp
-	url = https://github.com/Danmoreng/qwen3-tts.cpp.git
+	url = https://github.com/hobpond/qwen3-tts.cpp.git
+	branch = main
+[submodule "external/qwen3-asr-cpp"]
+	path = external/qwen3-asr-cpp
+	url = https://github.com/predict-woo/qwen3-asr.cpp.git
 	branch = main

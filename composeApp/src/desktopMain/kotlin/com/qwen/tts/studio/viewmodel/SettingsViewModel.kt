@@ -57,9 +57,11 @@ class SettingsViewModel : ViewModel() {
         private const val HF_BASE_URL = "https://huggingface.co/$HUGGING_FACE_REPO/resolve/main"
         const val HUGGING_FACE_REPO_URL = "https://huggingface.co/$HUGGING_FACE_REPO/tree/main"
         private const val TOKENIZER_Q8 = "qwen-tokenizer-12hz-Q8_0.gguf"
+        const val ASR_MODEL_NAME = "qwen3-asr-0.6b-q8_0.gguf"
 
         private val fileSizes = mapOf(
             TOKENIZER_Q8 to 291_150_624L,
+            ASR_MODEL_NAME to 1_010_000_000L,
             "qwen-talker-0.6b-base-Q8_0.gguf" to 992_615_488L,
             "qwen-talker-1.7b-base-Q8_0.gguf" to 2_079_448_256L,
             "qwen-talker-1.7b-customvoice-Q8_0.gguf" to 2_042_834_304L,
@@ -106,11 +108,25 @@ class SettingsViewModel : ViewModel() {
                     hfFile(TOKENIZER_Q8),
                     hfFile("qwen-talker-1.7b-voicedesign-Q8_0.gguf")
                 )
+            ),
+            ModelDownloadOption(
+                id = "qwen3-asr-0.6b-q8",
+                title = "Qwen3-ASR 0.6B Q8_0",
+                description = "Native GGUF speech recognition for batch validation.",
+                primaryModelName = ASR_MODEL_NAME,
+                files = listOf(asrFile(ASR_MODEL_NAME))
             )
         )
 
         private fun hfFile(fileName: String): ModelDownloadFile =
             ModelDownloadFile(fileName, "$HF_BASE_URL/$fileName?download=true", fileSizes[fileName] ?: 0L)
+
+        private fun asrFile(fileName: String): ModelDownloadFile =
+            ModelDownloadFile(
+                fileName,
+                "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/$fileName?download=true",
+                fileSizes[fileName] ?: 0L
+            )
     }
 
     private val defaultAppDir = File(System.getProperty("user.home"), ".qwen-tts-studio")
@@ -397,7 +413,7 @@ class SettingsViewModel : ViewModel() {
                 }
 
                 refreshLocalModelState()
-                selected.firstOrNull()?.primaryModelName?.let { primary ->
+                    selected.firstOrNull()?.primaryModelName?.takeIf { it.startsWith("qwen-talker", ignoreCase = true) }?.let { primary ->
                     if (_availableModelNames.value.any { it.equals(primary, ignoreCase = true) }) {
                         _modelName.value = primary
                     }
