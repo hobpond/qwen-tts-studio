@@ -21,7 +21,7 @@ The native boundary is the `external/` CMake project, which adds the `external/q
 - `-PortableCpu` disables GGML native CPU detection, enables an AVX2 baseline, and disables AVX-512-related options. The packaging script always passes this option for Windows distributions.
 - Windows expects `qwen3_tts.dll`, `ggml.dll`, `ggml-base.dll`, and `ggml-cpu.dll`; CUDA additionally requires `ggml-cuda.dll`. The build script copies these artifacts to the repository root by default for development/runtime discovery.
 - Linux uses [`scripts/build-native.sh`](../../../scripts/build-native.sh). `CUDA=ON` enables CUDA, the script builds with `nproc`, copies `libqwen3_tts.so` and GGML libraries to the repository root, and also copies a `qwen3-tts-cli` executable when found.
-- Both native paths depend on the `external/qwen3-tts-cpp` submodule. The human build guide gives `git submodule update --init --recursive` as the recovery command when that directory is empty.
+- Both native paths depend on the checked-out `external/qwen3-tts-cpp` and `external/qwen3-asr-cpp` submodules. A fresh checkout must run `git submodule update --init --recursive` before configuring CMake; the command is recovery for a missing or unpopulated checkout, not the normal state of this workspace.
 - `build_cuda.ps1` is a separate older-style Windows CUDA helper. It uses `external/build`, Visual Studio x64 CMake generation, and copies a smaller set of DLLs, so it is not equivalent to the parameterized `scripts/build-native.ps1` path.
 
 ## Inference

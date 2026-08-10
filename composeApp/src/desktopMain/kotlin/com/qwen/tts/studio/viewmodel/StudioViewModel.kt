@@ -6,16 +6,23 @@ import com.qwen.tts.studio.batch.BatchAudioStore
 import com.qwen.tts.studio.batch.BatchGenerationRequest
 import com.qwen.tts.studio.batch.BatchGenerationResult
 import com.qwen.tts.studio.batch.BatchGenerationSession
+import com.qwen.tts.studio.batch.BatchManifest
+import com.qwen.tts.studio.batch.BatchIdentity
+import com.qwen.tts.studio.batch.BatchVoiceMode
+import com.qwen.tts.studio.batch.BatchMemoryPlan
+import com.qwen.tts.studio.batch.BatchMemoryPolicy
 import com.qwen.tts.studio.batch.BatchValidationReport
 import com.qwen.tts.studio.batch.BatchValidator
 import com.qwen.tts.studio.batch.BatchAsrValidator
 import com.qwen.tts.studio.batch.NativeBatchAsrTranscriber
 import com.qwen.tts.studio.batch.QwenBatchEngine
+import com.qwen.tts.studio.batch.TextBatching
 import com.qwen.tts.studio.engine.NativeBackendPreference
 import com.qwen.tts.studio.engine.QwenEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +36,7 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
+import java.util.UUID
 import javax.sound.sampled.AudioFileFormat
 import javax.sound.sampled.AudioFormat
 import javax.sound.sampled.AudioInputStream
@@ -98,7 +106,9 @@ data class StudioUiState(
 /** A fixed speaker artifact captured from an accepted Read Aloud/VoiceDesign preview. */
 data class ReusableVoiceSnapshot(
     val speakerEmbeddingPath: String? = null,
+    val speakerEmbeddingSha256: String? = null,
     val referenceWavPath: String,
+    val referenceWavSha256: String? = null,
     val modelDir: String,
     val modelName: String?,
     val backend: NativeBackendPreference,
@@ -107,11 +117,19 @@ data class ReusableVoiceSnapshot(
     val sourceInstruction: String?
 )
 
+internal fun reusableVoiceValidationError(snapshot: ReusableVoiceSnapshot?): String? =
+    if (snapshot != null && snapshot.speakerEmbeddingPath.isNullOrBlank()) {
+        "The kept voice has no reusable conditioning artifact; capture a cloning-capable preview before starting batch output."
+    } else {
+        null
+    }
+
 data class StudioBatchUiState(
     val isRunning: Boolean = false,
     val completed: Int = 0,
     val total: Int = 0,
     val currentIndex: Int = -1,
+    val manifest: BatchManifest? = null,
     val result: BatchGenerationResult? = null,
     val error: String? = null,
     val isRecombining: Boolean = false,
@@ -234,6 +252,10 @@ class StudioViewModel : ViewModel() {
         _uiState.update { it.copy(useStreaming = enabled, error = null) }
     }
 
+    /** Returns the current host/native memory plan used for new batch text. */
+    fun batchMemoryPlan(): BatchMemoryPlan =
+        BatchMemoryPolicy.plan(BatchMemoryPolicy.snapshot(qwenEngine.backendMemory()))
+
     /**
      * Freezes the speaker identity from the last completed preview for later batch use.
      * The native API has no VoiceDesign handle, so the accepted WAV is converted to the
@@ -251,10 +273,10 @@ class StudioViewModel : ViewModel() {
             return null
         }
         val isVoiceDesignPreview = state.modelKind == QwenEngine.MODEL_KIND_VOICE_DESIGN
-        if (modelDir.isBlank() || (!state.supportsCloning && !isVoiceDesignPreview) || state.text.isBlank()) {
+        if (modelDir.isBlank() || !state.supportsCloning || state.text.isBlank()) {
             _uiState.update {
                 it.copy(error = if (isVoiceDesignPreview) {
-                    "Enter the preview text before keeping this designed voice."
+                    "This VoiceDesign preview has no reusable conditioning artifact; keep a cloning-capable preview instead."
                 } else {
                     "The loaded model does not expose a reusable voice-clone path."
                 })
@@ -265,32 +287,32 @@ class StudioViewModel : ViewModel() {
 
         _uiState.update { it.copy(isCapturingVoice = true, error = null) }
         return viewModelScope.launch(Dispatchers.IO) {
-            val snapshotRoot = File(System.getProperty("java.io.tmpdir"), "qwen-tts-studio-voice-snapshots")
-            val stamp = System.currentTimeMillis()
+            val snapshotRoot = BatchIdentity.durableVoiceArtifactDirectory()
+            val stamp = UUID.randomUUID().toString()
             val previewFile = File(snapshotRoot, "preview-$stamp.wav")
             val embeddingFile = File(snapshotRoot, "voice-$stamp-d${state.speakerEmbeddingDim}.json")
             try {
                 snapshotRoot.mkdirs()
                 writeWav(previewFile, samples, lastGeneratedSampleRate)
-                val speakerEmbeddingPath = if (isVoiceDesignPreview) {
-                    null
-                } else {
-                    // The accepted preview was generated by the current engine session. Reuse it
-                    // for extraction: reloading here releases the TTS model path that the native
-                    // lazy encoder may still need.
-                    val extraction = withContext(nativeDispatcher) {
-                        qwenEngine.extractSpeakerEmbeddingDetailed(previewFile.absolutePath, embeddingFile.absolutePath)
-                    }
-                    if (!extraction.success || !embeddingFile.isFile) {
-                        throw IllegalStateException(extraction.errorMsg ?: "Could not capture a reusable speaker embedding.")
-                    }
-                    embeddingFile.absolutePath
+                // The accepted preview was generated by the current engine session. Reuse it
+                // for extraction: reloading here releases the TTS model path that the native
+                // lazy encoder may still need.
+                val extraction = withContext(nativeDispatcher) {
+                    qwenEngine.extractSpeakerEmbeddingDetailed(previewFile.absolutePath, embeddingFile.absolutePath)
                 }
+                if (!extraction.success || !embeddingFile.isFile) {
+                    throw IllegalStateException(extraction.errorMsg ?: "Could not capture a reusable speaker embedding.")
+                }
+                val speakerEmbeddingPath = embeddingFile.absolutePath
+                val speakerEmbeddingSha256 = BatchIdentity.sha256File(embeddingFile)
+                val referenceWavSha256 = BatchIdentity.sha256File(previewFile)
                 _uiState.update {
                     it.copy(
                         reusableVoiceSnapshot = ReusableVoiceSnapshot(
                             speakerEmbeddingPath = speakerEmbeddingPath,
+                            speakerEmbeddingSha256 = speakerEmbeddingSha256,
                             referenceWavPath = previewFile.absolutePath,
+                            referenceWavSha256 = referenceWavSha256,
                             modelDir = File(modelDir).absoluteFile.normalize().path,
                             modelName = modelName?.trim().takeUnless { it.isNullOrEmpty() },
                             backend = backendPreference,
@@ -302,6 +324,7 @@ class StudioViewModel : ViewModel() {
                     )
                 }
             } catch (error: Throwable) {
+                if (error is CancellationException) throw error
                 embeddingFile.delete()
                 previewFile.delete()
                 _uiState.update { it.copy(error = "Could not keep this voice for batch: ${error.message ?: "unknown error"}") }
@@ -312,10 +335,12 @@ class StudioViewModel : ViewModel() {
     }
 
     fun clearCapturedVoice() {
-        val snapshot = _uiState.value.reusableVoiceSnapshot
-        snapshot?.speakerEmbeddingPath?.let { File(it).delete() }
-        snapshot?.referenceWavPath?.let { File(it).delete() }
         _uiState.update { it.copy(reusableVoiceSnapshot = null) }
+    }
+
+    /** Test seam for exercising cleanup/replay without loading a native model. */
+    internal fun installReusableVoiceSnapshotForTest(snapshot: ReusableVoiceSnapshot) {
+        _uiState.update { it.copy(reusableVoiceSnapshot = snapshot) }
     }
 
     private fun applyCapabilitiesAndSpeakers(
@@ -537,10 +562,11 @@ class StudioViewModel : ViewModel() {
      */
     fun startBatchGeneration(request: BatchGenerationRequest): Job? {
         if (_uiState.value.isGenerating || batchJob?.isActive == true) return null
+        val effectiveRequest = request.withCapturedVoiceSemantics()
         batchCancelled = false
         _batchState.value = StudioBatchUiState(
             isRunning = true,
-            total = request.texts.size,
+            total = effectiveRequest.texts.size,
             startedAtMillis = System.currentTimeMillis(),
             statusMessage = "Loading model and checking existing chunks..."
         )
@@ -549,9 +575,9 @@ class StudioViewModel : ViewModel() {
                 val result = withContext(nativeDispatcher) {
                         BatchGenerationSession(
                             QwenBatchEngine(qwenEngine),
-                        BatchAudioStore(request.outputDirectory)
+                        BatchAudioStore(effectiveRequest.outputDirectory)
                     ).run(
-                        request = request,
+                        request = effectiveRequest,
                         shouldCancel = { batchCancelled },
                         onProgress = { completed, total ->
                         val now = System.currentTimeMillis()
@@ -572,6 +598,9 @@ class StudioViewModel : ViewModel() {
                             )
                         }
                         },
+                        onManifest = { manifest ->
+                            _batchState.update { state -> state.copy(manifest = manifest) }
+                        },
                         onStatus = { message ->
                             _batchState.update { state -> state.copy(statusMessage = message) }
                         }
@@ -582,6 +611,7 @@ class StudioViewModel : ViewModel() {
                         isRunning = false,
                         completed = result.items.size,
                         currentIndex = result.items.lastOrNull()?.index ?: -1,
+                        manifest = result.manifest,
                         result = result,
                         error = result.error,
                         isRecombining = false,
@@ -592,6 +622,9 @@ class StudioViewModel : ViewModel() {
                         statusMessage = null
                     )
                 }
+            } catch (e: CancellationException) {
+                _batchState.update { it.copy(isRunning = false, statusMessage = "Batch cancelled.") }
+                throw e
             } catch (e: Throwable) {
                 _batchState.update {
                     it.copy(isRunning = false, error = e.message ?: "Batch generation failed.")
@@ -619,6 +652,10 @@ class StudioViewModel : ViewModel() {
     ): Job? {
         val state = _uiState.value
         if (voiceSnapshot != null) {
+            reusableVoiceValidationError(voiceSnapshot)?.let { error ->
+                reportBatchError(error)
+                return null
+            }
             val requestedModel = modelName?.trim().takeUnless { it.isNullOrEmpty() }
             val requestedDir = File(modelDir).absoluteFile.normalize().path
             if (voiceSnapshot.modelDir != requestedDir || voiceSnapshot.modelName != requestedModel) {
@@ -647,6 +684,18 @@ class StudioViewModel : ViewModel() {
                 speakerEmbeddingPath = effectiveEmbedding,
                 iclPromptPath = effectiveIcl,
                 voiceProvenance = voiceSnapshot?.sourceInstruction,
+                voiceMode = when {
+                    voiceSnapshot != null -> BatchVoiceMode.CAPTURED_VOICE
+                    selectedSpeaker != null -> BatchVoiceMode.NAMED_SPEAKER
+                    !effectiveIcl.isNullOrBlank() -> BatchVoiceMode.ICL_PROMPT
+                    !effectiveEmbedding.isNullOrBlank() -> BatchVoiceMode.SPEAKER_EMBEDDING
+                    else -> BatchVoiceMode.MODEL_DEFAULT
+                },
+                speakerEmbeddingSha256 = voiceSnapshot?.speakerEmbeddingSha256
+                    ?: BatchIdentity.sha256FileOrNull(effectiveEmbedding),
+                referenceWavPath = voiceSnapshot?.referenceWavPath,
+                referenceWavSha256 = voiceSnapshot?.referenceWavSha256,
+                iclPromptSha256 = BatchIdentity.sha256FileOrNull(effectiveIcl),
                 outputDirectory = outputDirectory.toPath()
             )
         )
@@ -666,22 +715,27 @@ class StudioViewModel : ViewModel() {
         require(chunks.all { it.text.isNotBlank() }) {
             "Manifest contains a blank source-text chunk and cannot be replayed."
         }
-        val metadata = manifest.metadata
-        val modelDir = metadata["modelDir"]?.takeIf(String::isNotBlank)
-            ?: error("Manifest is missing modelDir metadata.")
+        val identity = BatchIdentity.fromManifestMetadata(manifest.metadata, chunks.map { it.text })
+        BatchIdentity.requireArtifactIntegrity(identity)
         return BatchGenerationRequest(
             batchId = manifest.batchId,
-            modelDir = modelDir,
-            modelName = metadata["modelName"]?.takeIf(String::isNotBlank),
-            backendPreference = NativeBackendPreference.fromId(metadata["backendPreference"]),
+            modelDir = identity.modelDir,
+            modelName = identity.modelName,
+            backendPreference = identity.backendPreference,
             texts = chunks.map { it.text },
-            languageId = metadata["languageId"]?.toIntOrNull() ?: QwenEngine.mapLanguageToId(_uiState.value.selectedLanguage),
-            instruction = metadata["instruction"]?.takeIf(String::isNotBlank),
-            speaker = metadata["speaker"]?.takeIf(String::isNotBlank),
-            speakerEmbeddingPath = metadata["speakerEmbeddingPath"]?.takeIf(String::isNotBlank),
-            iclPromptPath = metadata["iclPromptPath"]?.takeIf(String::isNotBlank),
+            languageId = identity.languageId.takeIf { it != 0 }
+                ?: QwenEngine.mapLanguageToId(_uiState.value.selectedLanguage),
+            instruction = identity.instruction.takeUnless { identity.voiceMode == BatchVoiceMode.CAPTURED_VOICE },
+            speaker = identity.speaker,
+            speakerEmbeddingPath = identity.speakerEmbeddingPath,
+            iclPromptPath = identity.iclPromptPath,
             outputDirectory = store.directoryPath,
-            voiceProvenance = metadata["voiceProvenance"]?.takeIf(String::isNotBlank),
+            voiceProvenance = identity.voiceProvenance,
+            voiceMode = identity.voiceMode,
+            speakerEmbeddingSha256 = identity.speakerEmbeddingSha256,
+            referenceWavPath = identity.referenceWavPath,
+            referenceWavSha256 = identity.referenceWavSha256,
+            iclPromptSha256 = identity.iclPromptSha256,
             preserveChunkBoundaries = true
         )
     }
@@ -698,26 +752,47 @@ class StudioViewModel : ViewModel() {
     ): BatchGenerationRequest {
         val state = _uiState.value
         val selectedSpeaker = state.selectedSpeaker.takeIf { state.supportsNamedSpeakers && it.isNotBlank() }
-        val metadata = mapOf(
-            "modelDir" to File(modelDir).absoluteFile.normalize().path,
-            "modelName" to (modelName ?: ""),
-            "backendPreference" to backendPreference.id,
-            "voiceMode" to when {
-                selectedSpeaker != null -> "named-speaker"
-                !iclPromptPath.isNullOrBlank() -> "icl-prompt"
-                !speakerEmbeddingPath.isNullOrBlank() -> "speaker-embedding"
-                else -> "model-default"
+        val capturedVoice = state.reusableVoiceSnapshot
+        reusableVoiceValidationError(capturedVoice)?.let { error(it) }
+        val plan = batchMemoryPlan()
+        val maxCharacters = plan.maxCharacters ?: error(plan.reason ?: "Insufficient observed memory for batch planning.")
+        val plannedTexts = TextBatching.packParagraphs(texts.joinToString(separator = ""), maxCharacters)
+        val effectiveInstruction = state.selectedInstruction.takeIf {
+            capturedVoice == null && state.supportsInstruction && it.isNotBlank()
+        }
+        val effectiveEmbedding = (capturedVoice?.speakerEmbeddingPath ?: speakerEmbeddingPath).takeIf {
+            state.supportsCloning && selectedSpeaker == null && iclPromptPath.isNullOrBlank()
+        }
+        val generatedRequest = BatchGenerationRequest(
+            batchId = "generated-${System.currentTimeMillis()}",
+            modelDir = modelDir,
+            modelName = modelName,
+            backendPreference = backendPreference,
+            texts = plannedTexts,
+            languageId = QwenEngine.mapLanguageToId(state.selectedLanguage),
+            instruction = effectiveInstruction,
+            speaker = selectedSpeaker,
+            speakerEmbeddingPath = effectiveEmbedding,
+            iclPromptPath = iclPromptPath.takeIf { capturedVoice == null },
+            outputDirectory = outputDirectory.toPath(),
+            voiceProvenance = capturedVoice?.sourceInstruction,
+            voiceMode = when {
+                capturedVoice != null -> BatchVoiceMode.CAPTURED_VOICE
+                selectedSpeaker != null -> BatchVoiceMode.NAMED_SPEAKER
+                !iclPromptPath.isNullOrBlank() -> BatchVoiceMode.ICL_PROMPT
+                !effectiveEmbedding.isNullOrBlank() -> BatchVoiceMode.SPEAKER_EMBEDDING
+                else -> BatchVoiceMode.MODEL_DEFAULT
             },
-            "speaker" to (selectedSpeaker ?: ""),
-            "instruction" to (state.selectedInstruction.takeIf { state.supportsInstruction && it.isNotBlank() } ?: ""),
-            "speakerEmbeddingPath" to (speakerEmbeddingPath ?: ""),
-            "iclPromptPath" to (iclPromptPath ?: ""),
-            "languageId" to QwenEngine.mapLanguageToId(state.selectedLanguage).toString()
+            speakerEmbeddingSha256 = capturedVoice?.speakerEmbeddingSha256
+                ?: BatchIdentity.sha256FileOrNull(effectiveEmbedding),
+            referenceWavPath = capturedVoice?.referenceWavPath,
+            referenceWavSha256 = capturedVoice?.referenceWavSha256,
+            iclPromptSha256 = BatchIdentity.sha256FileOrNull(iclPromptPath)
         )
         BatchAudioStore(outputDirectory.toPath()).generateManifestFromTexts(
-            batchId = "generated-${System.currentTimeMillis()}",
-            texts = texts,
-            metadata = metadata
+            batchId = generatedRequest.batchId,
+            texts = plannedTexts,
+            metadata = BatchIdentity.forRequest(generatedRequest).metadata()
         )
         return loadBatchManifest(outputDirectory.resolve("manifest.json"))
     }
@@ -747,21 +822,23 @@ class StudioViewModel : ViewModel() {
 
     fun validateBatchManifestWithAsr(manifestFile: File, asrModelFile: File, sourceFile: File? = null): Job {
         return viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
+            try {
                 val store = BatchAudioStore(manifestFile.toPath().toAbsolutePath().normalize().parent)
                 val manifest = store.loadManifest(manifestFile.toPath())
                 val source = sourceFile?.takeIf { it.isFile }?.readText(Charsets.UTF_8)
                 val deterministic = BatchValidator.validate(store, manifest, source)
-                val transcriber = NativeBatchAsrTranscriber(asrModelFile)
-                val asr = try {
-                    BatchAsrValidator.validate(store, manifest, transcriber)
-                } finally {
-                    transcriber.close()
+                val asr = withContext(nativeDispatcher) {
+                    val transcriber = NativeBatchAsrTranscriber(asrModelFile)
+                    try {
+                        BatchAsrValidator.validate(store, manifest, transcriber)
+                    } finally {
+                        transcriber.close()
+                    }
                 }
-                deterministic.copy(asrFindings = asr)
-            }.onSuccess { report ->
-                _batchState.update { it.copy(validationReport = report, error = null) }
-            }.onFailure { error ->
+                _batchState.update { it.copy(validationReport = deterministic.copy(asrFindings = asr), error = null) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
                 reportBatchError("ASR validation failed: ${error.message ?: "unknown error"}")
             }
         }
@@ -1359,17 +1436,25 @@ class StudioViewModel : ViewModel() {
     }
 
     override fun onCleared() {
-        _uiState.value.reusableVoiceSnapshot?.let { snapshot ->
-            File(snapshot.speakerEmbeddingPath).delete()
-            File(snapshot.referenceWavPath).delete()
-        }
         batchCancelled = true
         batchJob?.cancel()
-        nativeDispatcher.dispatch(EmptyCoroutineContext) {
-            qwenEngine.release()
-            nativeDispatcher.close()
-        }
-        super.onCleared()
         stopPlayback(resetPosition = false)
+        super.onCleared()
+        runCatching {
+            nativeDispatcher.dispatch(EmptyCoroutineContext) {
+                try {
+                    qwenEngine.release()
+                } finally {
+                    nativeDispatcher.close()
+                }
+            }
+        }.onFailure {
+            runCatching { qwenEngine.release() }
+            runCatching { nativeDispatcher.close() }
+        }
     }
+
+    private fun BatchGenerationRequest.withCapturedVoiceSemantics(): BatchGenerationRequest =
+        if (voiceProvenance.isNullOrBlank()) this else copy(instruction = null)
+
 }

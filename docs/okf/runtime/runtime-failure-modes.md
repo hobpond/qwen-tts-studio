@@ -24,7 +24,7 @@ tags: [runtime, diagnostics, failures, troubleshooting]
 
 ## Inference / limits
 
-- These are runtime boundaries observed in the Kotlin and build code, not a native crash taxonomy. The C++ implementation is unavailable because the checked-out submodule directory is empty.
+- These are runtime boundaries observed in the Kotlin and build code, not a native crash taxonomy. The checked-out TTS and ASR source submodules are available for source inspection, while native crash and model behavior still require a matching build and smoke test.
 - The most useful diagnostic tuple is: OS, Java/runtime launch location, model directory/name, backend preference, native artifact names, JNI versus CLI mode, operation (load, capability, synthesis, extraction, playback), and exact native/process error.
 
 ## Related concepts

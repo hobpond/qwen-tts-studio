@@ -33,4 +33,3 @@ For routine Windows development, `run-compose.ps1 -BuildNative` is the most comp
 - [Native CPU and CUDA builds](native-builds.md)
 - [Gradle and the JVM toolchain](gradle-jvm-toolchain.md)
 - [Packaging](packaging.md)
-

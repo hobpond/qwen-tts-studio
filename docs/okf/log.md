@@ -2,6 +2,8 @@
 
 ## 2026-08-09
 
+* **Fix**: Batch validation presentation now renders every ASR prefix/suffix finding with chunk, expected text, transcript, score, pass/fail, and error details. The Batch screen also serializes validation against generation/recombination through screen-local job state, preventing validation reads from racing active batch file writes while preserving view-model ownership of workflow work.
+* **Documentation**: Refreshed native-boundary concepts to reflect the populated TTS/ASR source submodules and clarified that CPU persistence overlap remains distinct from validation actions.
 * **UX**: Moved batch generation out of the Synthesis view into a dedicated Batch navigation tab. The batch workflow keeps its existing manifest, resume, regeneration, validation, and recombination state through the shared Studio view model.
 * **UX**: ASR validation now resolves the standard Qwen3-ASR GGUF from the Setup-managed model directory; Batch no longer asks users to browse for an ASR model.
 

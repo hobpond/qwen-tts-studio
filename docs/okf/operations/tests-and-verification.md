@@ -31,4 +31,3 @@ Passing `:composeApp:test` is evidence for the pure embedding logic only. It doe
 - [Gradle and the JVM toolchain](gradle-jvm-toolchain.md)
 - [GitHub release workflow](github-release-workflow.md)
 - [Common troubleshooting](troubleshooting.md)
-

@@ -16,12 +16,15 @@ import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -33,8 +36,12 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.qwen.tts.studio.batch.BatchAudioStore
 import com.qwen.tts.studio.batch.BatchChunkStatus
+import com.qwen.tts.studio.batch.BatchGenerationRequest
+import com.qwen.tts.studio.batch.BatchIdentity
 import com.qwen.tts.studio.batch.BatchManifest
+import com.qwen.tts.studio.batch.BatchVoiceMode
 import com.qwen.tts.studio.batch.TextBatching
+import com.qwen.tts.studio.engine.QwenEngine
 import com.qwen.tts.studio.viewmodel.SettingsViewModel
 import com.qwen.tts.studio.viewmodel.StudioViewModel
 import com.qwen.tts.studio.viewmodel.VoiceCloneMode
@@ -46,6 +53,8 @@ import io.github.vinceglb.filekit.compose.rememberFileSaverLauncher
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
+import java.util.Locale
+import kotlinx.coroutines.Job
 
 @Composable
 fun BatchScreen(
@@ -73,7 +82,9 @@ fun BatchScreen(
     val missingIclPrompt = uiState.supportsCloning && !useNamedSpeaker &&
         uiState.voiceCloneMode == VoiceCloneMode.IclPrompt && selectedVoicePreset?.isSystem == false &&
         uiState.speakerEmbeddingDim > 0 && iclPromptPath == null
-    val batchVoiceEmbeddingPath = uiState.reusableVoiceSnapshot?.speakerEmbeddingPath ?: speakerEmbeddingPath
+    val capturedVoice = uiState.reusableVoiceSnapshot
+    val batchVoiceEmbeddingPath = capturedVoice?.speakerEmbeddingPath ?: speakerEmbeddingPath
+    val capturedVoiceInvalid = capturedVoice != null && capturedVoice.speakerEmbeddingPath.isNullOrBlank()
     var batchTextFile by remember { mutableStateOf("") }
     var batchTexts by remember { mutableStateOf(emptyList<String>()) }
     var batchOutputDirectory by remember { mutableStateOf("") }
@@ -82,12 +93,31 @@ fun BatchScreen(
     var batchManifest by remember { mutableStateOf<BatchManifest?>(null) }
     var batchManifestPath by remember { mutableStateOf<File?>(null) }
     var batchSourceFile by remember { mutableStateOf<File?>(null) }
+    var allowIncompatibleReplacement by remember { mutableStateOf(false) }
+    var validationJob by remember { mutableStateOf<Job?>(null) }
+
+    LaunchedEffect(validationJob) {
+        val job = validationJob ?: return@LaunchedEffect
+        job.join()
+        if (validationJob === job) validationJob = null
+    }
+    DisposableEffect(Unit) {
+        onDispose { validationJob?.cancel() }
+    }
+
+    val validationActive = validationJob?.isActive == true
+    val fileWriteActive = batchState.isRunning || batchState.isRecombining
+    val workflowBusy = validationActive || fileWriteActive
 
     val batchTextPicker = rememberFilePickerLauncher(
         type = PickerType.File(extensions = listOf("txt", "text")), title = "Select Batch Text File"
     ) { file ->
         file?.path?.let { path ->
-            runCatching { TextBatching.packParagraphs(Files.readString(File(path).toPath(), StandardCharsets.UTF_8)) }
+            runCatching {
+                val plan = viewModel.batchMemoryPlan()
+                val limit = plan.maxCharacters ?: error(plan.reason ?: "Insufficient observed memory for batch planning.")
+                TextBatching.packParagraphs(Files.readString(File(path).toPath(), StandardCharsets.UTF_8), limit)
+            }
                 .onSuccess { texts ->
                     batchTextFile = path
                     batchTexts = texts
@@ -155,6 +185,35 @@ fun BatchScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (uiState.reusableVoiceSnapshot != null || uiState.hasAudio) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            when {
+                                capturedVoiceInvalid -> "The kept preview voice has no reusable conditioning artifact."
+                                uiState.reusableVoiceSnapshot != null -> "Reusable preview voice is ready for batch generation."
+                                uiState.supportsCloning -> "A completed preview can be captured for batch reuse."
+                                else -> "This model cannot capture a reusable preview voice."
+                            },
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (capturedVoiceInvalid) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (uiState.reusableVoiceSnapshot != null) {
+                            OutlinedButton(onClick = viewModel::clearCapturedVoice, enabled = !workflowBusy) {
+                                Text("Clear kept voice")
+                            }
+                        } else if (uiState.hasAudio && uiState.supportsCloning) {
+                            OutlinedButton(
+                                onClick = { viewModel.captureCurrentVoiceForBatch(modelDir, modelName, backendPreference) },
+                                enabled = !workflowBusy && !uiState.isGenerating && !uiState.isCapturingVoice
+                            ) { Text(if (uiState.isCapturingVoice) "Capturing..." else "Keep preview voice") }
+                        }
+                    }
+                }
                 if (batchState.isRunning) {
                     LinearProgressIndicator(
                         progress = { if (batchState.total > 0) batchState.completed.toFloat() / batchState.total else 0f },
@@ -169,8 +228,8 @@ fun BatchScreen(
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(batchTextFile, {}, readOnly = true, label = { Text("Text file or manifest") }, modifier = Modifier.weight(1f), singleLine = true)
-                    OutlinedButton(onClick = { batchTextPicker.launch() }, enabled = !batchState.isRunning) { Text("Browse") }
-                    OutlinedButton(onClick = { batchManifestPicker.launch() }, enabled = !batchState.isRunning) { Text("Load manifest") }
+                    OutlinedButton(onClick = { batchTextPicker.launch() }, enabled = !workflowBusy) { Text("Browse") }
+                    OutlinedButton(onClick = { batchManifestPicker.launch() }, enabled = !workflowBusy) { Text("Load manifest") }
                     OutlinedButton(
                         onClick = {
                             runCatching {
@@ -182,32 +241,40 @@ fun BatchScreen(
                                 batchTextFile = "Manifest: ${batchManifestPath!!.path}"
                             }.onFailure { error -> viewModel.reportBatchError("Could not generate manifest: ${error.message ?: "unknown error"}") }
                         },
-                        enabled = !batchState.isRunning && batchTextFile.isNotBlank() && batchTexts.isNotEmpty()
+                        enabled = !workflowBusy && !capturedVoiceInvalid && batchTextFile.isNotBlank() && batchTexts.isNotEmpty()
                     ) { Text("Generate manifest") }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(batchOutputDirectory, { batchOutputDirectory = it }, label = { Text("Output directory") }, modifier = Modifier.weight(1f), singleLine = true)
-                    OutlinedButton(onClick = { batchDirectoryPicker.launch() }, enabled = !batchState.isRunning) {
+                    OutlinedButton(onClick = { batchDirectoryPicker.launch() }, enabled = !workflowBusy) {
                         androidx.compose.material3.Icon(Icons.Default.FolderOpen, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Browse")
                     }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = allowIncompatibleReplacement,
+                        onCheckedChange = { allowIncompatibleReplacement = it },
+                        enabled = !workflowBusy && batchReplayRequest == null
+                    )
+                    Text("Allow replacing an incompatible existing batch", style = MaterialTheme.typography.bodySmall)
                 }
                 if (batchReplayRequest != null) {
                     OutlinedTextField(
                         batchRegenerateSelection, { batchRegenerateSelection = it },
                         label = { Text("Chunks to regenerate") },
                         supportingText = { Text("Blank to resume; e.g. 0, 3-5") },
-                        modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !batchState.isRunning
+                        modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !workflowBusy
                     )
                 }
-                (batchManifest ?: batchState.result?.manifest)?.let { manifest ->
+                (batchState.manifest ?: batchManifest ?: batchState.result?.manifest)?.let { manifest ->
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Batch parts (${manifest.expectedChunkCount})", style = MaterialTheme.typography.labelLarge)
                         manifest.chunks.sortedBy { it.index }.forEach { chunk ->
                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text("${chunk.index}: ${chunk.status} · ${chunk.text.replace("\n", " ").take(90)}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
-                                if (batchReplayRequest != null && !batchState.isRunning) {
+                                if (batchReplayRequest != null && !workflowBusy) {
                                     OutlinedButton(onClick = {
                                         val replay = batchReplayRequest ?: return@OutlinedButton
                                         viewModel.startBatchGeneration(replay.copy(regenerateIndices = if (chunk.status == BatchChunkStatus.COMPLETE) setOf(chunk.index) else emptySet(), onlyIndices = setOf(chunk.index)))
@@ -215,17 +282,49 @@ fun BatchScreen(
                                 }
                             }
                         }
-                        if (manifest.chunks.size == manifest.expectedChunkCount && manifest.chunks.all { it.status == BatchChunkStatus.COMPLETE } && !batchState.isRunning) {
+                        if (manifest.chunks.size == manifest.expectedChunkCount && manifest.chunks.all { it.status == BatchChunkStatus.COMPLETE } && !workflowBusy) {
                             OutlinedButton(onClick = { batchRecombineSaver.launch(baseName = "batch-combined", extension = "wav") }) { Text("Combine") }
                         }
                         batchManifestPath?.let { path ->
-                            OutlinedButton(onClick = { viewModel.validateBatchManifest(path, batchSourceFile) }) { Text("Validate") }
-                            OutlinedButton(onClick = { viewModel.validateBatchManifestWithAsr(path, asrModelFile, batchSourceFile) }, enabled = asrModelFile.isFile) { Text("Validate with ASR") }
+                            OutlinedButton(
+                                onClick = { validationJob = viewModel.validateBatchManifest(path, batchSourceFile) },
+                                enabled = !workflowBusy
+                            ) { Text("Validate") }
+                            OutlinedButton(
+                                onClick = { validationJob = viewModel.validateBatchManifestWithAsr(path, asrModelFile, batchSourceFile) },
+                                enabled = !workflowBusy && asrModelFile.isFile
+                            ) { Text("Validate with ASR") }
                             Text(if (asrModelFile.isFile) "ASR model installed by Setup" else "Install the ASR model from Model Settings", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        if (validationActive) {
+                            Text("Validation is running; batch file writes are paused until it finishes.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         batchState.validationReport?.let { report ->
                             Text("Validation: ${report.errors.size} errors, ${report.warnings.size} warnings", style = MaterialTheme.typography.bodySmall)
-                            if (report.asrFindings.isNotEmpty()) Text("ASR: ${report.asrFindings.size} windows checked", style = MaterialTheme.typography.bodySmall)
+                            if (report.asrFindings.isNotEmpty()) {
+                                Text("ASR findings (${report.asrFindings.size})", style = MaterialTheme.typography.labelLarge)
+                                report.asrFindings.forEach { finding ->
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.fillMaxWidth().padding(10.dp),
+                                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                                        ) {
+                                            val window = finding.window.name.lowercase(Locale.ROOT)
+                                            val outcome = if (finding.passed) "PASS" else "FAIL"
+                                            Text("$outcome · Chunk ${finding.chunkIndex} · $window", style = MaterialTheme.typography.labelMedium)
+                                            Text("Expected: ${finding.expectedText.ifBlank { "(none)" }}", style = MaterialTheme.typography.bodySmall)
+                                            Text("Transcript: ${finding.transcript ?: "(unavailable)"}", style = MaterialTheme.typography.bodySmall)
+                                            Text("Score: ${finding.score?.let { "%.3f".format(Locale.ROOT, it) } ?: "n/a"}", style = MaterialTheme.typography.bodySmall)
+                                            finding.error?.let { error ->
+                                                Text("Error: $error", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -241,9 +340,45 @@ fun BatchScreen(
                                     .onSuccess { viewModel.startBatchGeneration(replay.copy(regenerateIndices = it)) }
                                     .onFailure { viewModel.reportBatchError(it.message ?: "Invalid chunk selection.") }
                             } else {
-                                viewModel.startBatchGeneration(modelDir, modelName, batchVoiceEmbeddingPath, iclPromptPath, backendPreference, batchTexts, File(batchOutputDirectory), uiState.reusableVoiceSnapshot)
+                                val selectedSpeaker = uiState.selectedSpeaker.takeIf { uiState.supportsNamedSpeakers && it.isNotBlank() }
+                                val effectiveIcl = iclPromptPath.takeIf { capturedVoice == null && uiState.supportsCloning && selectedSpeaker == null }
+                                val effectiveEmbedding = batchVoiceEmbeddingPath.takeIf {
+                                    uiState.supportsCloning && selectedSpeaker == null && effectiveIcl == null
+                                }
+                                val instruction = uiState.selectedInstruction.takeIf {
+                                    capturedVoice == null && uiState.supportsInstruction && it.isNotBlank()
+                                }
+                                viewModel.startBatchGeneration(
+                                    BatchGenerationRequest(
+                                        batchId = "batch-${System.currentTimeMillis()}",
+                                        modelDir = modelDir,
+                                        modelName = modelName?.trim().takeUnless { it.isNullOrEmpty() },
+                                        backendPreference = backendPreference,
+                                        texts = batchTexts,
+                                        languageId = QwenEngine.mapLanguageToId(uiState.selectedLanguage),
+                                        instruction = instruction,
+                                        speaker = selectedSpeaker,
+                                        speakerEmbeddingPath = effectiveEmbedding,
+                                        iclPromptPath = effectiveIcl,
+                                        voiceProvenance = capturedVoice?.sourceInstruction,
+                                        voiceMode = when {
+                                            capturedVoice != null -> BatchVoiceMode.CAPTURED_VOICE
+                                            selectedSpeaker != null -> BatchVoiceMode.NAMED_SPEAKER
+                                            !effectiveIcl.isNullOrBlank() -> BatchVoiceMode.ICL_PROMPT
+                                            !effectiveEmbedding.isNullOrBlank() -> BatchVoiceMode.SPEAKER_EMBEDDING
+                                            else -> BatchVoiceMode.MODEL_DEFAULT
+                                        },
+                                        speakerEmbeddingSha256 = capturedVoice?.speakerEmbeddingSha256
+                                            ?: BatchIdentity.sha256FileOrNull(effectiveEmbedding),
+                                        referenceWavPath = capturedVoice?.referenceWavPath,
+                                        referenceWavSha256 = capturedVoice?.referenceWavSha256,
+                                        iclPromptSha256 = BatchIdentity.sha256FileOrNull(effectiveIcl),
+                                        outputDirectory = File(batchOutputDirectory).toPath(),
+                                        allowIncompatibleReplacement = allowIncompatibleReplacement
+                                    )
+                                )
                             }
-                        }, enabled = batchTexts.isNotEmpty() && batchOutputDirectory.isNotBlank() && !uiState.isGenerating && !batchState.isRunning && (batchReplayRequest != null || !missingSpeakerEmbedding) && (batchReplayRequest != null || !missingIclPrompt)) {
+                        }, enabled = batchTexts.isNotEmpty() && batchOutputDirectory.isNotBlank() && !capturedVoiceInvalid && !uiState.isGenerating && !workflowBusy && (batchReplayRequest != null || !missingSpeakerEmbedding) && (batchReplayRequest != null || !missingIclPrompt)) {
                             Text(if (batchReplayRequest != null && batchRegenerateSelection.isNotBlank()) "Regenerate selected" else if (batchReplayRequest != null) "Continue batch" else "Start batch")
                         }
                     }

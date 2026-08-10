@@ -59,7 +59,7 @@ data class BatchManifest(
 }
 
 /** Desktop persistence and strict recombination for generated mono PCM audio. */
-class BatchAudioStore(directory: Path) {
+open class BatchAudioStore(directory: Path) {
     private val directory = directory.toAbsolutePath().normalize()
     val directoryPath: Path get() = directory
     private val manifestPath = directory.resolve("manifest.json")
@@ -75,12 +75,14 @@ class BatchAudioStore(directory: Path) {
         batchId: String,
         metadata: Map<String, String> = emptyMap()
     ): BatchManifest {
+        val existing = existingManifest()
         val textFiles = Files.list(directory).use { stream ->
             stream.filter { it.fileName.toString().matches(Regex("chunk-\\d{6}\\.txt")) }
                 .sorted(compareBy { it.fileName.toString() })
                 .toList()
         }
         require(textFiles.isNotEmpty()) { "No chunk-XXXXXX.txt sidecars were found in $directory" }
+        requireCompatibleProvenance(existing, textFiles.size, metadata)
         val chunks = textFiles.mapIndexed { expectedIndex, textFile ->
             val name = textFile.fileName.toString()
             val index = name.removePrefix("chunk-").removeSuffix(".txt").toInt()
@@ -88,12 +90,12 @@ class BatchAudioStore(directory: Path) {
             val text = Files.readString(textFile, StandardCharsets.UTF_8)
             val wavFile = safeChild(chunkFileName(index))
             val base = BatchChunk(index, chunkFileName(index), text)
-            if (!Files.isRegularFile(wavFile)) base else runCatching {
-                val wav = Files.readAllBytes(wavFile)
-                val parsed = parseWav(wav)
-                base.copy(status = BatchChunkStatus.COMPLETE, sampleRate = parsed.sampleRate,
-                    frameCount = parsed.frameCount, sha256 = sha256(wav))
-            }.getOrElse { base.copy(error = it.message) }
+            provenComplete(existing?.chunks?.firstOrNull { it.index == index }, text, wavFile, index)
+                ?.let { parsed ->
+                    base.copy(status = BatchChunkStatus.COMPLETE, sampleRate = parsed.sampleRate,
+                        frameCount = parsed.frameCount, sha256 = existing?.chunks?.first { it.index == index }?.sha256)
+                }
+                ?: base
         }
         return BatchManifest(batchId, chunks.size, chunks, metadata).also(::persistManifest)
     }
@@ -105,17 +107,26 @@ class BatchAudioStore(directory: Path) {
         metadata: Map<String, String> = emptyMap()
     ): BatchManifest {
         require(texts.isNotEmpty()) { "No source chunks were supplied" }
+        val existing = existingManifest()
+        requireCompatibleProvenance(existing, texts.size, metadata)
+        if (existing != null) {
+            validateExistingProvenance(existing)
+        } else {
+            validateUnownedSidecars(texts)
+        }
         val chunks = texts.mapIndexed { index, text ->
             val fileName = chunkFileName(index)
-            writeAtomic(safeChild(textFileName(index)), text.toByteArray(StandardCharsets.UTF_8))
             val wavFile = safeChild(fileName)
             val base = BatchChunk(index, fileName, text)
-            if (!Files.isRegularFile(wavFile)) base else runCatching {
-                val wav = Files.readAllBytes(wavFile)
-                val parsed = parseWav(wav)
-                base.copy(status = BatchChunkStatus.COMPLETE, sampleRate = parsed.sampleRate,
-                    frameCount = parsed.frameCount, sha256 = sha256(wav))
-            }.getOrElse { base.copy(error = it.message) }
+            provenComplete(existing?.chunks?.firstOrNull { it.index == index }, text, wavFile, index)
+                ?.let { parsed ->
+                    base.copy(status = BatchChunkStatus.COMPLETE, sampleRate = parsed.sampleRate,
+                        frameCount = parsed.frameCount, sha256 = existing?.chunks?.first { it.index == index }?.sha256)
+                }
+                ?: base
+        }
+        texts.forEachIndexed { index, text ->
+            writeAtomic(safeChild(textFileName(index)), text.toByteArray(StandardCharsets.UTF_8))
         }
         return BatchManifest(batchId, chunks.size, chunks, metadata).also(::persistManifest)
     }
@@ -140,17 +151,18 @@ class BatchAudioStore(directory: Path) {
     /** Reopens a compatible batch and validates existing chunk files for resume. */
     fun createOrResumeManifest(batchId: String, texts: List<String>, metadata: Map<String, String> = emptyMap()): BatchManifest {
         require(texts.isNotEmpty()) { "texts must not be empty" }
-        val compatible = if (Files.exists(manifestPath)) {
-            val existing = Files.readString(manifestPath, StandardCharsets.UTF_8)
-            // The output directory is the durable batch identity. The UI may create a
-            // fresh transient request ID after a restart, so requiring batchId here
-            // would make every resume look like a new batch. Stable model/voice/text
-            // metadata below still prevents adopting unrelated output.
-            existing.contains("\"expectedChunkCount\":${texts.size}") &&
-                metadata.filterKeys { it != "batchMaxCharacters" }.all { (key, value) ->
-                    existing.contains("\"${jsonEscape(key)}\":\"${jsonEscape(value)}\"")
-                }
-        } else false
+        // The output directory is the durable batch identity. The UI may create a
+        // fresh transient request ID after a restart, so requiring batchId here
+        // would make every resume look like a new batch. Stable metadata and the
+        // persisted source text still prevent adopting unrelated output.
+        val existing = if (Files.isRegularFile(manifestPath)) {
+            runCatching { loadManifest() }.getOrNull()
+        } else null
+        val compatible = existing != null &&
+            existing.expectedChunkCount == texts.size &&
+            metadata.filterKeys { it != "batchMaxCharacters" }.all { (key, value) ->
+                existing.metadata[key] == value
+            }
         if (!compatible) {
             return BatchManifest(
                 batchId,
@@ -162,19 +174,47 @@ class BatchAudioStore(directory: Path) {
         val resumed = texts.mapIndexed { index, text ->
             val fileName = chunkFileName(index)
             val file = safeChild(fileName)
-            if (!Files.isRegularFile(file)) return@mapIndexed BatchChunk(index, fileName, text)
+            val previous = existing?.chunks?.firstOrNull { it.index == index }
+            // A stale WAV is not evidence of a completed chunk. Only a chunk that
+            // was durably marked COMPLETE for the same source text may be resumed.
+            if (previous?.status != BatchChunkStatus.COMPLETE || previous.text != text || !Files.isRegularFile(file)) {
+                return@mapIndexed BatchChunk(index, fileName, text)
+            }
             runCatching {
                 val wav = Files.readAllBytes(file)
                 val parsed = parseWav(wav)
+                if (previous.sha256 == null || sha256(wav) != previous.sha256) {
+                    return@runCatching BatchChunk(
+                        index,
+                        fileName,
+                        text,
+                        BatchChunkStatus.PENDING,
+                        error = "Existing WAV checksum mismatch; regeneration required"
+                    )
+                }
                 val textFile = safeChild(textFileName(index))
                 if (!Files.isRegularFile(textFile) || Files.readString(textFile, StandardCharsets.UTF_8) != text) {
                     writeAtomic(textFile, text.toByteArray(StandardCharsets.UTF_8))
                 }
                 BatchChunk(index, fileName, text, BatchChunkStatus.COMPLETE, parsed.sampleRate,
-                    parsed.frameCount, sha256(wav))
+                    parsed.frameCount, previous.sha256)
             }.getOrElse { BatchChunk(index, fileName, text, error = it.message) }
         }
         return BatchManifest(batchId, texts.size, resumed, metadata).also(::persistManifest)
+    }
+
+    /** Durably invalidates a chunk before native generation begins. */
+    fun markPending(manifest: BatchManifest, index: Int, text: String): BatchManifest {
+        require(index in 0 until manifest.expectedChunkCount) { "Chunk index is outside the batch" }
+        val existing = manifest.chunks.firstOrNull { it.index == index }
+        return manifest.withChunk(
+            BatchChunk(
+                index = index,
+                fileName = existing?.fileName ?: chunkFileName(index),
+                text = text,
+                status = BatchChunkStatus.PENDING
+            )
+        ).also(::persistManifest)
     }
 
     fun writeChunk(manifest: BatchManifest, index: Int, audio: GeneratedAudio, text: String = ""): BatchManifest {
@@ -183,7 +223,7 @@ class BatchAudioStore(directory: Path) {
     }
 
     /** Encodes and atomically writes one chunk without changing the manifest. */
-    fun writeChunkFile(manifest: BatchManifest, index: Int, audio: GeneratedAudio, text: String = ""): BatchChunk {
+    open fun writeChunkFile(manifest: BatchManifest, index: Int, audio: GeneratedAudio, text: String = ""): BatchChunk {
         require(index in 0 until manifest.expectedChunkCount) { "Chunk index is outside the batch" }
         val fileName = manifest.chunks.firstOrNull { it.index == index }?.fileName ?: chunkFileName(index)
         val target = safeChild(fileName)
@@ -195,9 +235,9 @@ class BatchAudioStore(directory: Path) {
             audio.samples.size.toLong(), sha256(wav))
     }
 
-    fun markFailed(manifest: BatchManifest, index: Int, error: String): BatchManifest =
+    fun markFailed(manifest: BatchManifest, index: Int, error: String, text: String? = null): BatchManifest =
         manifest.withChunk(BatchChunk(index, manifest.chunks.firstOrNull { it.index == index }?.fileName ?: chunkFileName(index),
-            manifest.chunks.firstOrNull { it.index == index }?.text ?: "",
+            text ?: manifest.chunks.firstOrNull { it.index == index }?.text ?: "",
             BatchChunkStatus.FAILED, error = error)).also(::persistManifest)
 
     fun markCancelled(manifest: BatchManifest, index: Int): BatchManifest =
@@ -243,6 +283,78 @@ class BatchAudioStore(directory: Path) {
         val child = directory.resolve(fileName).normalize()
         require(child.parent == directory.toAbsolutePath().normalize()) { "Chunk file escapes batch directory" }
         return child
+    }
+
+    private fun existingManifest(): BatchManifest? =
+        if (Files.isRegularFile(manifestPath)) loadManifest() else null
+
+    private fun requireCompatibleProvenance(
+        existing: BatchManifest?,
+        expectedChunkCount: Int,
+        metadata: Map<String, String>
+    ) {
+        if (existing == null) return
+        require(existing.expectedChunkCount == expectedChunkCount) {
+            "Existing manifest has ${existing.expectedChunkCount} chunks; refusing incompatible input"
+        }
+        val compatible = metadata.filterKeys { it != "batchMaxCharacters" }.all { (key, value) ->
+            existing.metadata[key] == value
+        }
+        require(compatible) { "Existing manifest metadata is incompatible; refusing to overwrite provenance" }
+    }
+
+    private fun validateUnownedSidecars(texts: List<String>) {
+        val sidecars = Files.list(directory).use { stream ->
+            stream.filter { it.fileName.toString().matches(Regex("chunk-\\d{6}\\.txt")) }.toList()
+        }
+        sidecars.forEach { sidecar ->
+            val index = sidecar.fileName.toString().removePrefix("chunk-").removeSuffix(".txt").toInt()
+            require(index in texts.indices && Files.readString(sidecar, StandardCharsets.UTF_8) == texts[index]) {
+                "Existing sidecar has no compatible provenance; refusing to overwrite ${sidecar.fileName}"
+            }
+        }
+    }
+
+    private fun validateExistingProvenance(existing: BatchManifest) {
+        existing.chunks.forEach { previous ->
+            val sidecar = safeChild(textFileName(previous.index))
+            if (Files.isRegularFile(sidecar)) {
+                require(Files.readString(sidecar, StandardCharsets.UTF_8) == previous.text) {
+                    "Existing sidecar does not match manifest chunk ${previous.index}"
+                }
+            }
+            if (previous.status == BatchChunkStatus.COMPLETE) {
+                val wav = safeChild(previous.fileName)
+                require(Files.isRegularFile(wav)) { "Completed chunk ${previous.index} WAV is missing" }
+                val bytes = Files.readAllBytes(wav)
+                val parsed = parseWav(bytes)
+                require(previous.sha256 != null && sha256(bytes) == previous.sha256) {
+                    "Completed chunk ${previous.index} WAV checksum is invalid"
+                }
+                require(parsed.sampleRate == previous.sampleRate && parsed.frameCount == previous.frameCount) {
+                    "Completed chunk ${previous.index} WAV metadata is invalid"
+                }
+            }
+        }
+    }
+
+    private fun provenComplete(
+        previous: BatchChunk?,
+        text: String,
+        wavFile: Path,
+        index: Int
+    ): ParsedWav? {
+        if (previous?.status != BatchChunkStatus.COMPLETE || previous.text != text ||
+            previous.sha256 == null || !Files.isRegularFile(wavFile)) return null
+        val sidecar = safeChild(textFileName(index))
+        if (!Files.isRegularFile(sidecar) || Files.readString(sidecar, StandardCharsets.UTF_8) != text) return null
+        return runCatching {
+            val bytes = Files.readAllBytes(wavFile)
+            val parsed = parseWav(bytes)
+            require(sha256(bytes) == previous.sha256)
+            require(parsed.sampleRate == previous.sampleRate && parsed.frameCount == previous.frameCount)
+            parsed
+        }.getOrNull()
     }
 
     private fun writeAtomic(target: Path, bytes: ByteArray) {

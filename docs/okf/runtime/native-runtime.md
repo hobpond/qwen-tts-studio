@@ -25,4 +25,3 @@ Qwen-TTS Studio keeps inference in the native Qwen3 C++ backend. The desktop Kot
 - [CLI fallback](cli-fallback.md)
 - [Synthesis, streaming, and playback](synthesis-streaming-playback.md)
 - [Runtime failure modes](runtime-failure-modes.md)
-

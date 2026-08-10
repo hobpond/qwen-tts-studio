@@ -64,7 +64,7 @@ The parent CMake contract is concrete:
 - [`build-native.ps1`](/scripts/build-native.ps1) configures the external CMake project, builds `qwen3_tts_shared`, validates the expected GGML/native artifacts, and optionally copies them to the repository root. The shell script provides the analogous Linux flow.
 - CUDA is a build-time option forwarded through CMake and a runtime backend preference exposed through settings.
 
-In the inspected workspace, the submodule directory is present but empty, so files inside `qwen3-tts-cpp` and the implementation of `qwen3_tts_jni.cpp` were not directly verified. Statements about that implementation are limited to the parent CMake contract and the repository's existing OKF/build documentation.
+The checked-out `qwen3-tts-cpp` submodule contains its native source tree, and the adjacent `qwen3-asr-cpp` submodule contains the ASR source tree. The parent CMake contract and the native sources are therefore available for source-level inspection; model-backed runtime behavior still requires a native build and smoke test.
 
 ## Architectural inference
 

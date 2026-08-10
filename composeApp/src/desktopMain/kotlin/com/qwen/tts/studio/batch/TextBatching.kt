@@ -1,26 +1,31 @@
 package com.qwen.tts.studio.batch
 
-/** Packs complete paragraphs up to the Studio input limit without dropping source text. */
+/**
+ * Builds the final chunk plan for batch generation.
+ *
+ * Every returned chunk is a contiguous substring of [source]. Joining the
+ * returned chunks with an empty separator therefore reproduces [source]
+ * exactly. Paragraph separators are kept with the paragraph before them so a
+ * chunk boundary never requires inventing whitespace later.
+ */
 object TextBatching {
     const val DEFAULT_MAX_CHARACTERS = 5_000
 
     fun packParagraphs(source: String, maxCharacters: Int = DEFAULT_MAX_CHARACTERS): List<String> {
         require(maxCharacters > 0) { "maxCharacters must be positive" }
-        val normalized = source.replace("\r\n", "\n").replace('\r', '\n')
-        val separatorPattern = Regex("\\n[\\t ]*\\n+")
+        val separatorPattern = Regex("(?:\\r?\\n)[\\t ]*(?:\\r?\\n)+")
         val segments = mutableListOf<String>()
         var cursor = 0
-        var pendingSeparator = ""
-        separatorPattern.findAll(normalized).forEach { match ->
-            segments += pendingSeparator + normalized.substring(cursor, match.range.first)
-            pendingSeparator = match.value
+        separatorPattern.findAll(source).forEach { match ->
+            segments += source.substring(cursor, match.range.last + 1)
             cursor = match.range.last + 1
         }
-        segments += pendingSeparator + normalized.substring(cursor)
+        if (cursor < source.length) segments += source.substring(cursor)
 
         val batches = mutableListOf<String>()
         var current = StringBuilder()
-        segments.filter(String::isNotEmpty).forEach { segment ->
+        segments.forEach { segment ->
+            if (segment.isEmpty()) return@forEach
             if (segment.length > maxCharacters) {
                 if (current.isNotEmpty()) {
                     batches += current.toString()

@@ -91,6 +91,46 @@ class BatchAudioTest {
     }
 
     @Test
+    fun rejectsTamperedButValidWavDuringResume() {
+        val root = Files.createTempDirectory("batch-tampered-wav")
+        val store = BatchAudioStore(root)
+        val metadata = mapOf("textFingerprint" to "fingerprint", "modelDir" to "model")
+        store.writeChunk(
+            store.createManifest("tampered", 1, metadata),
+            0,
+            GeneratedAudio(floatArrayOf(0.1f, 0.2f), 24_000),
+            "unchanged source"
+        )
+        val wav = Files.readAllBytes(root.resolve("chunk-000000.wav"))
+        wav[44] = (wav[44].toInt() xor 0x01).toByte()
+        Files.write(root.resolve("chunk-000000.wav"), wav)
+
+        val resumed = store.createOrResumeManifest("tampered", listOf("unchanged source"), metadata)
+        val chunk = resumed.chunks.single()
+        val persisted = store.loadManifest(root.resolve("manifest.json"))
+
+        assertEquals(BatchChunkStatus.PENDING, chunk.status)
+        assertEquals(null, chunk.sha256)
+        assertEquals(null, persisted.chunks.single().sha256)
+        assertEquals(BatchChunkStatus.PENDING, persisted.chunks.single().status)
+    }
+
+    @Test
+    fun doesNotTreatAnOldWavAsCompleteAfterManifestMarksChunkFailed() {
+        val root = Files.createTempDirectory("batch-stale-wav")
+        val store = BatchAudioStore(root)
+        val metadata = mapOf("textFingerprint" to "fingerprint", "modelDir" to "model")
+        var manifest = store.createManifest("stale", 1, metadata)
+        manifest = store.writeChunk(manifest, 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "original")
+        manifest = store.markFailed(manifest, 0, "replacement failed", "replacement")
+
+        val resumed = store.createOrResumeManifest("stale", listOf("replacement"), metadata)
+
+        assertEquals(BatchChunkStatus.PENDING, resumed.chunks.single().status)
+        assertEquals("replacement", resumed.chunks.single().text)
+    }
+
+    @Test
     fun loadsManifestAsReplayableArtifact() {
         val root = Files.createTempDirectory("batch-manifest-replay")
         val store = BatchAudioStore(root)
@@ -117,14 +157,92 @@ class BatchAudioTest {
     fun generatesManifestFromChunkSidecarsAndExistingWavs() {
         val root = Files.createTempDirectory("batch-manifest-generate")
         val store = BatchAudioStore(root)
-        store.writeChunk(store.createManifest("seed", 1), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "sidecar text")
+        val metadata = mapOf("modelDir" to "model")
+        store.writeChunk(store.createManifest("seed", 1, metadata), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "sidecar text")
 
-        val generated = store.generateManifestFromSidecars("rebuilt", mapOf("modelDir" to "model"))
+        val generated = store.generateManifestFromSidecars("rebuilt", metadata)
 
         assertEquals("rebuilt", generated.batchId)
         assertEquals(BatchChunkStatus.COMPLETE, generated.chunks.single().status)
         assertEquals("sidecar text", generated.chunks.single().text)
         assertEquals(mapOf("modelDir" to "model"), generated.metadata)
+    }
+
+    @Test
+    fun freshTextScanLeavesParseableButUnprovenWavPending() {
+        val root = Files.createTempDirectory("batch-fresh-text-scan")
+        val seed = BatchAudioStore(Files.createTempDirectory("batch-seed"))
+        val seedManifest = seed.writeChunk(seed.createManifest("seed", 1), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "old text")
+        Files.write(root.resolve("chunk-000000.wav"), Files.readAllBytes(seed.directoryPath.resolve(seedManifest.chunks.single().fileName)))
+
+        val store = BatchAudioStore(root)
+        val generated = store.generateManifestFromTexts("fresh", listOf("new text"))
+
+        assertEquals(BatchChunkStatus.PENDING, generated.chunks.single().status)
+        assertEquals("new text", Files.readString(root.resolve("chunk-000000.txt")))
+    }
+
+    @Test
+    fun freshSidecarScanLeavesParseableButUnprovenWavPending() {
+        val root = Files.createTempDirectory("batch-fresh-sidecar-scan")
+        val seed = BatchAudioStore(Files.createTempDirectory("batch-seed"))
+        val seedManifest = seed.writeChunk(seed.createManifest("seed", 1), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "sidecar text")
+        Files.write(root.resolve("chunk-000000.wav"), Files.readAllBytes(seed.directoryPath.resolve(seedManifest.chunks.single().fileName)))
+        Files.writeString(root.resolve("chunk-000000.txt"), "sidecar text")
+
+        val generated = BatchAudioStore(root).generateManifestFromSidecars("fresh")
+
+        assertEquals(BatchChunkStatus.PENDING, generated.chunks.single().status)
+    }
+
+    @Test
+    fun matchingProvenanceIsAcceptedByBothScanPaths() {
+        val textRoot = Files.createTempDirectory("batch-matching-text")
+        val metadata = mapOf("modelDir" to "model")
+        val textStore = BatchAudioStore(textRoot)
+        textStore.writeChunk(textStore.createManifest("seed", 1, metadata), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "same text")
+
+        val fromTexts = textStore.generateManifestFromTexts("replay", listOf("same text"), metadata)
+        val fromSidecars = textStore.generateManifestFromSidecars("replay-sidecars", metadata)
+
+        assertEquals(BatchChunkStatus.COMPLETE, fromTexts.chunks.single().status)
+        assertEquals(BatchChunkStatus.COMPLETE, fromSidecars.chunks.single().status)
+    }
+
+    @Test
+    fun staleWavRemainsPendingForBothScanPaths() {
+        val textRoot = Files.createTempDirectory("batch-stale-text")
+        val metadata = mapOf("modelDir" to "model")
+        val textStore = BatchAudioStore(textRoot)
+        textStore.writeChunk(textStore.createManifest("seed", 1, metadata), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "old text")
+
+        val fromTexts = textStore.generateManifestFromTexts("new-text", listOf("new text"), metadata)
+        assertEquals(BatchChunkStatus.PENDING, fromTexts.chunks.single().status)
+
+        val sidecarRoot = Files.createTempDirectory("batch-stale-sidecar")
+        val sidecarStore = BatchAudioStore(sidecarRoot)
+        sidecarStore.writeChunk(sidecarStore.createManifest("seed", 1, metadata), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "old text")
+        Files.writeString(sidecarRoot.resolve("chunk-000000.txt"), "new text")
+
+        val fromSidecars = sidecarStore.generateManifestFromSidecars("new-sidecar", metadata)
+        assertEquals(BatchChunkStatus.PENDING, fromSidecars.chunks.single().status)
+    }
+
+    @Test
+    fun incompatibleTextInputDoesNotOverwriteExistingSidecarOrManifest() {
+        val root = Files.createTempDirectory("batch-incompatible-provenance")
+        val store = BatchAudioStore(root)
+        val oldMetadata = mapOf("modelDir" to "old-model")
+        store.writeChunk(store.createManifest("seed", 1, oldMetadata), 0, GeneratedAudio(floatArrayOf(0.1f), 24_000), "old text")
+        val oldManifest = Files.readAllBytes(root.resolve("manifest.json"))
+        val oldSidecar = Files.readAllBytes(root.resolve("chunk-000000.txt"))
+
+        assertFailsWith<IllegalArgumentException> {
+            store.generateManifestFromTexts("new", listOf("new text"), mapOf("modelDir" to "new-model"))
+        }
+
+        assertContentEquals(oldManifest, Files.readAllBytes(root.resolve("manifest.json")))
+        assertContentEquals(oldSidecar, Files.readAllBytes(root.resolve("chunk-000000.txt")))
     }
 
     @Test

@@ -26,4 +26,3 @@ tags: [runtime, jni, lifecycle, resources]
 - [Model loading](model-loading.md)
 - [CLI fallback](cli-fallback.md)
 - [Runtime failure modes](runtime-failure-modes.md)
-

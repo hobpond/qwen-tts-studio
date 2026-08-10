@@ -8,7 +8,7 @@ class TextBatchingTest {
     @Test
     fun combinesCompleteParagraphsWithoutExceedingLimit() {
         assertEquals(
-            listOf("one two\n\nalpha beta", "\n\ngamma"),
+            listOf("one two\n\n", "alpha beta\n\ngamma"),
             TextBatching.packParagraphs("one two\n\nalpha beta\n\ngamma", 20)
         )
     }
@@ -29,14 +29,22 @@ class TextBatchingTest {
     }
 
     @Test
+    fun preservesEveryCharacterIncludingLineEndingsAndSeparators() {
+        val source = "\r\nfirst\r\n\r\nsecond\n \t\nthird\r"
+        val chunks = TextBatching.packParagraphs(source, 7)
+
+        assertEquals(source, chunks.joinToString(separator = ""))
+        assertTrue(chunks.all { it.length <= 7 })
+    }
+
+    @Test
     fun t1RoundTripsWithoutMissingCharacters() {
         val path = java.nio.file.Path.of("D:\\t1.txt")
         if (!java.nio.file.Files.isRegularFile(path)) return
-        val source = java.nio.file.Files.readString(path).replace("\r\n", "\n").replace('\r', '\n')
+        val source = java.nio.file.Files.readString(path)
         val chunks = TextBatching.packParagraphs(source, 5_000)
 
         assertTrue(chunks.isNotEmpty())
-        assertEquals(6, chunks.size)
         assertEquals(source, chunks.joinToString(separator = ""))
         assertEquals(source.length, chunks.sumOf(String::length))
         assertTrue(chunks.all { it.length <= 5_000 })
