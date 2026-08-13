@@ -18,7 +18,13 @@ internal object BatchManifestCodec {
                 sampleRate = reader.number("sampleRate")?.toInt(),
                 frameCount = reader.number("frameCount"),
                 sha256 = reader.string("sha256"),
-                error = reader.string("error")
+                error = reader.string("error"),
+                voiceName = reader.string("voiceName"),
+                modelName = reader.string("modelName"),
+                voicePrompt = reader.string("voicePrompt"),
+                validationPassed = reader.boolean("validationPassed"),
+                validationMessage = reader.string("validationMessage"),
+                validationSignature = reader.string("validationSignature")
             )
         }
         return BatchManifest(batchId, expected, chunks, metadata)
@@ -26,6 +32,14 @@ internal object BatchManifestCodec {
 
     private class JsonReader(private val json: String) {
         fun string(key: String): String? = valueStart(key)?.let { parseString(it) }
+
+        fun boolean(key: String): Boolean? = valueStart(key)?.let { start ->
+            when {
+                json.startsWith("true", start) -> true
+                json.startsWith("false", start) -> false
+                else -> null
+            }
+        }
 
         fun number(key: String): Long? = valueStart(key)?.let { start ->
             val relativeEnd = json.substring(start).indexOfFirst { it == ',' || it == '}' || it.isWhitespace() }

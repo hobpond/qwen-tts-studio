@@ -7,6 +7,9 @@ import com.qwen.tts.studio.batch.BatchGenerationRequest
 import com.qwen.tts.studio.batch.BatchGenerationResult
 import com.qwen.tts.studio.batch.BatchGenerationSession
 import com.qwen.tts.studio.batch.BatchManifest
+import com.qwen.tts.studio.batch.BatchChunkStatus
+import com.qwen.tts.studio.batch.BatchChunkAlignment
+import com.qwen.tts.studio.batch.readValidAlignment
 import com.qwen.tts.studio.batch.BatchIdentity
 import com.qwen.tts.studio.batch.BatchVoiceMode
 import com.qwen.tts.studio.batch.BatchMemoryPlan
@@ -33,6 +36,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.coroutines.EmptyCoroutineContext
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
@@ -127,8 +131,10 @@ internal fun reusableVoiceValidationError(snapshot: ReusableVoiceSnapshot?): Str
 data class StudioBatchUiState(
     val isRunning: Boolean = false,
     val completed: Int = 0,
+    val generated: Int = 0,
     val total: Int = 0,
     val currentIndex: Int = -1,
+    val savingChunkIndex: Int? = null,
     val manifest: BatchManifest? = null,
     val result: BatchGenerationResult? = null,
     val error: String? = null,
@@ -139,7 +145,31 @@ data class StudioBatchUiState(
     val elapsedMillis: Long = 0L,
     val estimatedRemainingMillis: Long? = null,
     val statusMessage: String? = null
-    ,val validationReport: BatchValidationReport? = null
+    ,val validationReport: BatchValidationReport? = null,
+    val chunkValidation: Map<Int, BatchChunkValidationState> = emptyMap()
+    ,val playingChunkIndex: Int? = null,
+    val chunkPlaybackPositionSeconds: Float = 0f,
+    val chunkPlaybackDurationSeconds: Float = 0f,
+    val playingChunkWindowPrefix: Boolean? = null,
+    val playingChunkWindowStartSeconds: Float = 0f,
+    val playingChunkAlignment: BatchChunkAlignment? = null,
+    val textFile: String = "",
+    val texts: List<String> = emptyList(),
+    val outputDirectory: String = "",
+    val replayRequest: BatchGenerationRequest? = null,
+    val manifestFile: String? = null,
+    val sourceFile: String? = null,
+    val regenerateSelection: String = "",
+    val allowIncompatibleReplacement: Boolean = false,
+    val batchVoiceName: String? = null,
+    val batchModelName: String? = null,
+    val batchVoicePrompt: String? = null
+)
+
+data class BatchChunkValidationState(
+    val isRunning: Boolean = false,
+    val passed: Boolean? = null,
+    val message: String? = null
 )
 
 /**
@@ -156,6 +186,10 @@ class StudioViewModel : ViewModel() {
     private var lastGeneratedAudio: FloatArray? = null
     private var lastGeneratedSampleRate: Int = AUDIO_SAMPLE_RATE
     private var playbackJob: Job? = null
+    @Volatile private var batchPlaybackRequestedSample: Int? = null
+    @Volatile private var batchPlaybackPositionSample: Int = 0
+    private var batchPlaybackSampleRate: Int = 24_000
+    private var batchPlaybackPcm = ByteArray(0)
     @Volatile
     private var playbackRequestedPosition: Int? = null
     @Volatile
@@ -564,11 +598,20 @@ class StudioViewModel : ViewModel() {
         if (_uiState.value.isGenerating || batchJob?.isActive == true) return null
         val effectiveRequest = request.withCapturedVoiceSemantics()
         batchCancelled = false
+        val previousBatchState = _batchState.value
         _batchState.value = StudioBatchUiState(
             isRunning = true,
             total = effectiveRequest.texts.size,
             startedAtMillis = System.currentTimeMillis(),
-            statusMessage = "Loading model and checking existing chunks..."
+            statusMessage = "Loading model and checking existing chunks...",
+            textFile = previousBatchState.textFile,
+            texts = effectiveRequest.texts,
+            outputDirectory = effectiveRequest.outputDirectory.toString(),
+            replayRequest = effectiveRequest,
+            manifestFile = effectiveRequest.outputDirectory.resolve("manifest.json").toString(),
+            sourceFile = previousBatchState.sourceFile,
+            regenerateSelection = previousBatchState.regenerateSelection,
+            allowIncompatibleReplacement = effectiveRequest.allowIncompatibleReplacement
         )
         val job = viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -591,29 +634,56 @@ class StudioViewModel : ViewModel() {
                             }
                             state.copy(
                                 completed = completed,
+                                generated = maxOf(state.generated, completed),
                                 total = total,
                                 currentIndex = completed - 1,
+                                savingChunkIndex = null,
                                 elapsedMillis = elapsed,
                                 estimatedRemainingMillis = remaining
                             )
                         }
                         },
                         onManifest = { manifest ->
-                            _batchState.update { state -> state.copy(manifest = manifest) }
+                            val durableCompleted = manifest.chunks.count { it.status == BatchChunkStatus.COMPLETE }
+                            _batchState.update { state ->
+                                state.copy(
+                                    manifest = manifest,
+                                    completed = maxOf(state.completed, durableCompleted),
+                                    generated = maxOf(state.generated, durableCompleted)
+                                )
+                            }
+                        },
+                        onChunkStarted = { index ->
+                            _batchState.update { state -> state.copy(currentIndex = index) }
+                        },
+                        onChunkReady = { index ->
+                            _batchState.update { state ->
+                                state.copy(
+                                    generated = maxOf(state.generated + 1, state.completed),
+                                    savingChunkIndex = index,
+                                    statusMessage = "Chunk ${index + 1} generated; saving audio..."
+                                )
+                            }
                         },
                         onStatus = { message ->
                             _batchState.update { state -> state.copy(statusMessage = message) }
                         }
                     )
                 }
+                val durableManifest = runCatching {
+                    BatchAudioStore(result.outputDirectory).loadManifest()
+                }.getOrDefault(result.manifest)
+                val durableResult = result.copy(manifest = durableManifest)
                 _batchState.update {
                     it.copy(
                         isRunning = false,
                         completed = result.items.size,
+                        generated = result.items.size,
                         currentIndex = result.items.lastOrNull()?.index ?: -1,
-                        manifest = result.manifest,
-                        result = result,
-                        error = result.error,
+                        savingChunkIndex = null,
+                        manifest = durableManifest,
+                        result = durableResult,
+                        error = durableResult.error,
                         isRecombining = false,
                         combinedFile = null,
                         recombineError = null,
@@ -736,9 +806,48 @@ class StudioViewModel : ViewModel() {
             referenceWavPath = identity.referenceWavPath,
             referenceWavSha256 = identity.referenceWavSha256,
             iclPromptSha256 = identity.iclPromptSha256,
-            preserveChunkBoundaries = true
+            preserveChunkBoundaries = true,
+            defaultVoiceName = chunks.firstOrNull()?.voiceName
         )
     }
+
+    fun setBatchChunkVoice(manifestFile: File, chunkIndex: Int, voiceName: String, modelName: String? = null, voicePrompt: String? = null): BatchManifest {
+        require(voiceName.isNotBlank()) { "Voice name must not be blank." }
+        val store = BatchAudioStore(manifestFile.toPath().toAbsolutePath().normalize().parent)
+        val manifest = store.loadManifest(manifestFile.toPath())
+        val chunk = manifest.chunks.firstOrNull { it.index == chunkIndex } ?: error("Chunk $chunkIndex is not present in the manifest.")
+        val unchanged = chunk.voiceName == voiceName && (modelName == null || chunk.modelName == modelName) && (voicePrompt == null || chunk.voicePrompt == voicePrompt)
+        val updated = manifest.withChunk(chunk.copy(
+            voiceName = voiceName,
+            modelName = modelName ?: chunk.modelName,
+            voicePrompt = voicePrompt ?: chunk.voicePrompt,
+            status = if (unchanged) chunk.status else com.qwen.tts.studio.batch.BatchChunkStatus.PENDING,
+            sampleRate = if (unchanged) chunk.sampleRate else null,
+            frameCount = if (unchanged) chunk.frameCount else null,
+            sha256 = if (unchanged) chunk.sha256 else null,
+            error = if (unchanged) chunk.error else null,
+            validationPassed = if (unchanged) chunk.validationPassed else null,
+            validationMessage = if (unchanged) chunk.validationMessage else null,
+            validationSignature = if (unchanged) chunk.validationSignature else null
+        ))
+        store.persistManifest(updated)
+        _batchState.update { it.copy(manifest = updated) }
+        return updated
+    }
+
+    fun loadBatchModelSpeakers(modelDir: String, modelName: String, backend: NativeBackendPreference, onResult: (List<String>) -> Unit): Job =
+        viewModelScope.launch(Dispatchers.IO) {
+            val probe = QwenEngine()
+            val speakers = try {
+                withContext(nativeDispatcher) {
+                    val loaded = probe.loadDetailed(modelDir, modelName, backend)
+                    if (loaded.success && probe.getModelCapabilities()?.supportsNamedSpeakers == true) probe.getAvailableSpeakers() else emptyList()
+                }
+            } finally {
+                withContext(nativeDispatcher) { probe.release() }
+            }
+            withContext(Dispatchers.Main) { onResult(speakers) }
+        }
 
     /** Recreates a replayable manifest from chunk sidecars already present in a folder. */
     fun generateBatchManifest(
@@ -748,17 +857,20 @@ class StudioViewModel : ViewModel() {
         modelName: String?,
         backendPreference: NativeBackendPreference,
         speakerEmbeddingPath: String?,
-        iclPromptPath: String?
+        iclPromptPath: String?,
+        instruction: String? = null,
+        defaultVoiceName: String? = null
     ): BatchGenerationRequest {
         val state = _uiState.value
-        val selectedSpeaker = state.selectedSpeaker.takeIf { state.supportsNamedSpeakers && it.isNotBlank() }
+        val selectedVoice = defaultVoiceName?.takeUnless(String::isBlank) ?: state.selectedVoice
+        val selectedSpeaker = selectedVoice.takeIf { it in state.availableSpeakers && state.supportsNamedSpeakers }
         val capturedVoice = state.reusableVoiceSnapshot
         reusableVoiceValidationError(capturedVoice)?.let { error(it) }
         val plan = batchMemoryPlan()
         val maxCharacters = plan.maxCharacters ?: error(plan.reason ?: "Insufficient observed memory for batch planning.")
         val plannedTexts = TextBatching.packParagraphs(texts.joinToString(separator = ""), maxCharacters)
-        val effectiveInstruction = state.selectedInstruction.takeIf {
-            capturedVoice == null && state.supportsInstruction && it.isNotBlank()
+        val effectiveInstruction = (instruction ?: state.selectedInstruction).takeIf {
+            capturedVoice == null && it.isNotBlank()
         }
         val effectiveEmbedding = (capturedVoice?.speakerEmbeddingPath ?: speakerEmbeddingPath).takeIf {
             state.supportsCloning && selectedSpeaker == null && iclPromptPath.isNullOrBlank()
@@ -775,6 +887,7 @@ class StudioViewModel : ViewModel() {
             speakerEmbeddingPath = effectiveEmbedding,
             iclPromptPath = iclPromptPath.takeIf { capturedVoice == null },
             outputDirectory = outputDirectory.toPath(),
+            defaultVoiceName = selectedVoice,
             voiceProvenance = capturedVoice?.sourceInstruction,
             voiceMode = when {
                 capturedVoice != null -> BatchVoiceMode.CAPTURED_VOICE
@@ -792,7 +905,10 @@ class StudioViewModel : ViewModel() {
         BatchAudioStore(outputDirectory.toPath()).generateManifestFromTexts(
             batchId = generatedRequest.batchId,
             texts = plannedTexts,
-            metadata = BatchIdentity.forRequest(generatedRequest).metadata()
+            metadata = BatchIdentity.forRequest(generatedRequest).metadata(),
+            defaultVoiceName = generatedRequest.defaultVoiceName,
+            defaultModelName = generatedRequest.modelName,
+            defaultVoicePrompt = generatedRequest.instruction
         )
         return loadBatchManifest(outputDirectory.resolve("manifest.json"))
     }
@@ -803,6 +919,183 @@ class StudioViewModel : ViewModel() {
 
     fun reportBatchError(message: String) {
         _batchState.update { it.copy(isRunning = false, error = message) }
+    }
+
+    fun setBatchSource(path: String, texts: List<String>, defaultOutputDirectory: String) {
+        _batchState.update {
+            it.copy(
+                textFile = path,
+                texts = texts,
+                outputDirectory = if (it.outputDirectory.isBlank()) defaultOutputDirectory else it.outputDirectory,
+                replayRequest = null,
+                manifest = null,
+                result = null,
+                manifestFile = null,
+                sourceFile = path,
+                regenerateSelection = ""
+            )
+        }
+    }
+
+    fun setBatchOutputDirectory(path: String) {
+        _batchState.update {
+            it.copy(
+                outputDirectory = path,
+                replayRequest = null,
+                manifest = null,
+                result = null,
+                manifestFile = null,
+                sourceFile = null,
+                regenerateSelection = ""
+            )
+        }
+    }
+
+    fun setBatchManifestWorkspace(path: File, request: BatchGenerationRequest, manifest: BatchManifest) {
+        val synchronizedRequest = request.copy(
+            texts = manifest.chunks.sortedBy { it.index }.map { it.text },
+            chunkVoices = manifestChunkVoices(manifest, request)
+        )
+        _batchState.update {
+            it.copy(
+                textFile = "Manifest: ${path.path}",
+                texts = synchronizedRequest.texts,
+                outputDirectory = synchronizedRequest.outputDirectory.toString(),
+                replayRequest = synchronizedRequest,
+                manifest = manifest,
+                result = null,
+                manifestFile = path.path,
+                sourceFile = null,
+                regenerateSelection = "",
+                batchVoiceName = manifest.chunks.firstOrNull()?.voiceName ?: request.defaultVoiceName,
+                batchModelName = manifest.chunks.firstOrNull()?.modelName ?: request.modelName,
+                batchVoicePrompt = manifest.chunks.firstOrNull()?.voicePrompt ?: request.instruction,
+                chunkValidation = validationStates(manifest)
+            )
+        }
+    }
+
+    fun setGeneratedBatchManifest(path: File, request: BatchGenerationRequest, manifest: BatchManifest) {
+        setBatchManifestWorkspace(path, request, manifest)
+    }
+
+    /** Reloads the external manifest and synchronizes every in-memory batch projection. */
+    fun refreshBatchManifestFromDisk(path: File? = null) {
+        val effectivePath = path ?: _batchState.value.manifestFile?.let(::File) ?: return
+        val normalized = effectivePath.toPath().toAbsolutePath().normalize()
+        val state = _batchState.value
+        if (state.manifestFile == null || File(state.manifestFile).toPath().toAbsolutePath().normalize() != normalized) return
+        val store = BatchAudioStore(normalized.parent)
+        val refreshed = runCatching { store.loadManifest(normalized) }.getOrNull() ?: return
+        if (refreshed == state.manifest) return
+        val request = state.replayRequest ?: return
+        val synchronizedRequest = request.copy(
+            texts = refreshed.chunks.sortedBy { it.index }.map { it.text },
+            chunkVoices = manifestChunkVoices(refreshed, request)
+        )
+        _batchState.update { current ->
+            if (current.manifestFile == null || File(current.manifestFile).toPath().toAbsolutePath().normalize() != normalized) current
+            else current.copy(
+                manifest = refreshed,
+                result = current.result?.copy(manifest = refreshed),
+                replayRequest = synchronizedRequest,
+                texts = synchronizedRequest.texts,
+                batchVoiceName = refreshed.chunks.firstOrNull()?.voiceName ?: current.batchVoiceName,
+                batchModelName = refreshed.chunks.firstOrNull()?.modelName ?: current.batchModelName,
+                batchVoicePrompt = refreshed.chunks.firstOrNull()?.voicePrompt ?: current.batchVoicePrompt,
+                chunkValidation = validationStates(refreshed)
+            )
+        }
+    }
+
+    private fun manifestChunkVoices(manifest: BatchManifest, request: BatchGenerationRequest): Map<Int, com.qwen.tts.studio.batch.BatchVoiceParameters> =
+        manifest.chunks.associate { chunk ->
+            chunk.index to com.qwen.tts.studio.batch.BatchVoiceParameters(
+                name = chunk.voiceName ?: request.speaker ?: request.defaultVoiceName ?: "Default Voice",
+                modelName = chunk.modelName ?: request.modelName,
+                voicePrompt = chunk.voicePrompt ?: request.instruction,
+                speaker = if (request.voiceMode == BatchVoiceMode.NAMED_SPEAKER) chunk.voiceName else null,
+                speakerEmbeddingPath = request.speakerEmbeddingPath,
+                iclPromptPath = request.iclPromptPath
+            )
+        }
+
+    fun setBatchRegenerateSelection(value: String) {
+        _batchState.update { it.copy(regenerateSelection = value) }
+    }
+
+    fun setBatchReplacementAllowed(value: Boolean) {
+        _batchState.update { it.copy(allowIncompatibleReplacement = value) }
+    }
+
+    private fun persistBatchValidation(manifestFile: File, manifest: BatchManifest, states: Map<Int, BatchChunkValidationState>): BatchManifest {
+        val updated = manifest.copy(chunks = manifest.chunks.map { chunk ->
+            states[chunk.index]?.let { state ->
+                chunk.copy(
+                    validationPassed = state.passed,
+                    validationMessage = state.message,
+                    validationSignature = com.qwen.tts.studio.batch.BatchValidationSignature.forChunk(chunk)
+                )
+            } ?: chunk
+        })
+        val store = BatchAudioStore(manifestFile.toPath().toAbsolutePath().normalize().parent)
+        store.persistManifest(updated)
+        // Re-read the durable artifact so the row state, active manifest, and
+        // completed result all observe the exact same lifecycle snapshot.
+        val refreshed = store.loadManifest(manifestFile.toPath())
+        val refreshedStates = validationStates(refreshed)
+        _batchState.update {
+            it.copy(
+                manifest = refreshed,
+                result = it.result?.copy(manifest = refreshed),
+                chunkValidation = refreshedStates
+            )
+        }
+        return refreshed
+    }
+
+    private fun validationStates(manifest: BatchManifest): Map<Int, BatchChunkValidationState> =
+        manifest.chunks.mapNotNull { chunk ->
+            if (com.qwen.tts.studio.batch.BatchValidationSignature.matches(chunk)) {
+                chunk.validationPassed?.let {
+                    chunk.index to BatchChunkValidationState(passed = it, message = chunk.validationMessage)
+                }
+            } else null
+        }.toMap()
+
+    fun setBatchVoiceDefaults(voiceName: String?, modelName: String?, voicePrompt: String?) {
+        _batchState.update {
+            it.copy(
+                batchVoiceName = voiceName?.takeUnless(String::isBlank),
+                batchModelName = modelName?.takeUnless(String::isBlank),
+                batchVoicePrompt = voicePrompt?.takeUnless(String::isBlank)
+            )
+        }
+    }
+
+    fun applyBatchVoiceDefaults(manifestFile: File, voiceName: String, modelName: String?, voicePrompt: String?): BatchManifest {
+        require(voiceName.isNotBlank()) { "Voice name must not be blank." }
+        val store = BatchAudioStore(manifestFile.toPath().toAbsolutePath().normalize().parent)
+        var manifest = store.loadManifest(manifestFile.toPath())
+        manifest.chunks.forEach { chunk ->
+            val unchanged = chunk.voiceName == voiceName && chunk.modelName == modelName && chunk.voicePrompt == voicePrompt
+            manifest = manifest.withChunk(chunk.copy(
+                voiceName = voiceName,
+                modelName = modelName,
+                voicePrompt = voicePrompt,
+                status = if (unchanged) chunk.status else com.qwen.tts.studio.batch.BatchChunkStatus.PENDING,
+                sampleRate = if (unchanged) chunk.sampleRate else null,
+                frameCount = if (unchanged) chunk.frameCount else null,
+                sha256 = if (unchanged) chunk.sha256 else null,
+                error = if (unchanged) chunk.error else null,
+                validationPassed = if (unchanged) chunk.validationPassed else null,
+                validationMessage = if (unchanged) chunk.validationMessage else null,
+                validationSignature = if (unchanged) chunk.validationSignature else null
+            ))
+        }
+        store.persistManifest(manifest)
+        _batchState.update { it.copy(manifest = manifest, batchVoiceName = voiceName, batchModelName = modelName, batchVoicePrompt = voicePrompt) }
+        return manifest
     }
 
     fun validateBatchManifest(manifestFile: File, sourceFile: File? = null): Job {
@@ -840,6 +1133,97 @@ class StudioViewModel : ViewModel() {
                 throw error
             } catch (error: Throwable) {
                 reportBatchError("ASR validation failed: ${error.message ?: "unknown error"}")
+            }
+        }
+    }
+
+    /** Validates one chunk, using ASR automatically when Setup has installed the model. */
+    fun validateBatchChunk(manifestFile: File, chunkIndex: Int, asrModelFile: File?, sourceFile: File? = null): Job {
+        _batchState.update { it.copy(chunkValidation = it.chunkValidation + (chunkIndex to BatchChunkValidationState(isRunning = true))) }
+        return viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val store = BatchAudioStore(manifestFile.toPath().toAbsolutePath().normalize().parent)
+                val manifest = store.loadManifest(manifestFile.toPath())
+                val chunk = manifest.chunks.firstOrNull { it.index == chunkIndex }
+                    ?: error("Chunk $chunkIndex is not present in the manifest.")
+                val deterministic = BatchValidator.validate(store, manifest, source = null)
+                val deterministicPassed = deterministic.findings.none { it.chunkIndex == chunkIndex && it.severity == com.qwen.tts.studio.batch.ValidationSeverity.ERROR }
+                val asrFindings = if (asrModelFile?.isFile == true && chunk.status == com.qwen.tts.studio.batch.BatchChunkStatus.COMPLETE) {
+                    withContext(nativeDispatcher) {
+                        val transcriber = NativeBatchAsrTranscriber(asrModelFile)
+                        try { BatchAsrValidator.validate(store, manifest, transcriber).filter { it.chunkIndex == chunkIndex } }
+                        finally { transcriber.close() }
+                    }
+                } else emptyList()
+                val passed = deterministicPassed && asrFindings.all { it.passed }
+                val message = if (passed) {
+                    if (asrFindings.isEmpty()) "Deterministic validation passed. ASR model is not installed."
+                    else "Deterministic and ASR validation passed."
+                } else {
+                    deterministic.findings.firstOrNull { it.chunkIndex == chunkIndex && it.severity == com.qwen.tts.studio.batch.ValidationSeverity.ERROR }?.message
+                        ?: asrFindings.firstOrNull { !it.passed }?.error ?: "Validation failed."
+                }
+                persistBatchValidation(manifestFile, manifest, mapOf(chunkIndex to BatchChunkValidationState(passed = passed, message = message)))
+                _batchState.update {
+                    it.copy(validationReport = deterministic.copy(asrFindings = asrFindings), error = null,
+                        chunkValidation = it.chunkValidation + (chunkIndex to BatchChunkValidationState(passed = passed, message = message)))
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Throwable) {
+                _batchState.update { it.copy(error = null, chunkValidation = it.chunkValidation + (chunkIndex to BatchChunkValidationState(passed = false, message = error.message ?: "Validation failed."))) }
+            }
+        }
+    }
+
+    /** Validates every manifest chunk in one serialized operation and updates row results. */
+    fun validateAllBatchChunks(manifestFile: File, asrModelFile: File?, sourceFile: File? = null): Job {
+        val manifestPath = manifestFile.toPath().toAbsolutePath().normalize()
+        val chunkIndexes = runCatching { BatchAudioStore(manifestPath.parent).loadManifest(manifestPath).chunks.map { it.index } }
+            .getOrDefault(emptyList())
+        _batchState.update { state ->
+            state.copy(chunkValidation = state.chunkValidation + chunkIndexes.associateWith { BatchChunkValidationState(isRunning = true) })
+        }
+        return viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val store = BatchAudioStore(manifestPath.parent)
+                val manifest = store.loadManifest(manifestPath)
+                val source = sourceFile?.takeIf { it.isFile }?.readText(Charsets.UTF_8)
+                val deterministic = BatchValidator.validate(store, manifest, source)
+                val asrFindings = if (asrModelFile?.isFile == true) {
+                    withContext(nativeDispatcher) {
+                        val transcriber = NativeBatchAsrTranscriber(asrModelFile)
+                        try { BatchAsrValidator.validate(store, manifest, transcriber) }
+                        finally { transcriber.close() }
+                    }
+                } else emptyList()
+                val errorsByChunk = deterministic.findings
+                    .filter { it.severity == com.qwen.tts.studio.batch.ValidationSeverity.ERROR }
+                    .groupBy { it.chunkIndex }
+                val asrByChunk = asrFindings.groupBy { it.chunkIndex }
+                val states = manifest.chunks.associate { chunk ->
+                    val chunkErrors = errorsByChunk[chunk.index].orEmpty()
+                    val failedAsr = asrByChunk[chunk.index].orEmpty().firstOrNull { !it.passed }
+                    val passed = chunkErrors.isEmpty() && failedAsr == null
+                    chunk.index to BatchChunkValidationState(
+                        passed = passed,
+                        message = if (passed) {
+                            if (asrFindings.isEmpty()) "Deterministic validation passed. ASR model is not installed."
+                            else "Deterministic and ASR validation passed."
+                        } else chunkErrors.firstOrNull()?.message ?: failedAsr?.error ?: "Validation failed."
+                    )
+                }
+                persistBatchValidation(manifestFile, manifest, states)
+                _batchState.update {
+                    it.copy(validationReport = deterministic.copy(asrFindings = asrFindings), error = null,
+                        chunkValidation = it.chunkValidation + states)
+                }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Throwable) {
+                _batchState.update {
+                    it.copy(error = null, chunkValidation = it.chunkValidation + chunkIndexes.associateWith {
+                        BatchChunkValidationState(passed = false, message = error.message ?: "Validation failed.")
+                    })
+                }
             }
         }
     }
@@ -931,6 +1315,120 @@ class StudioViewModel : ViewModel() {
     fun replayLastAudio() {
         seekPlayback(0f)
         startPlayback()
+    }
+
+    /** Plays a completed batch WAV through the desktop audio device. */
+    fun playBatchChunk(file: File) {
+        playBatchChunkWindow(file, null)
+    }
+
+    fun playBatchChunkWindow(file: File, prefix: Boolean?) {
+        if (!file.isFile) {
+            _batchState.update { it.copy(error = "Chunk audio file is missing: ${file.name}") }
+            return
+        }
+        stopPlayback(resetPosition = true)
+        val chunkIndex = file.nameWithoutExtension.removePrefix("chunk-").toIntOrNull()
+        batchPlaybackRequestedSample = 0
+        playbackJob = viewModelScope.launch(Dispatchers.IO) {
+            var line: SourceDataLine? = null
+            try {
+                AudioSystem.getAudioInputStream(file).use { source ->
+                    val target = AudioFormat(24_000f, 16, 1, true, false)
+                    AudioSystem.getAudioInputStream(target, source).use { pcm ->
+                        val output = ByteArrayOutputStream()
+                        val inputBuffer = ByteArray(PLAYBACK_CHUNK_SAMPLES * 2)
+                        var inputRead: Int
+                        while (pcm.read(inputBuffer).also { inputRead = it } >= 0) if (inputRead > 0) output.write(inputBuffer, 0, inputRead)
+                        val decodedPcm = output.toByteArray()
+                        batchPlaybackSampleRate = target.sampleRate.toInt()
+                        val totalSamples = decodedPcm.size / 2
+                        val windowSamples = batchPlaybackSampleRate * 5
+                        val startSample = when (prefix) {
+                            true -> 0
+                            false -> (totalSamples - windowSamples).coerceAtLeast(0)
+                            null -> 0
+                        }
+                        val endSample = when (prefix) {
+                            true -> windowSamples.coerceAtMost(totalSamples)
+                            false -> totalSamples
+                            null -> totalSamples
+                        }
+                        batchPlaybackPcm = decodedPcm.copyOfRange(startSample * 2, endSample * 2)
+                        batchPlaybackPositionSample = 0
+                        val fullDurationSeconds = totalSamples.toFloat() / batchPlaybackSampleRate.coerceAtLeast(1)
+                        val alignment = chunkIndex?.let { index ->
+                            runCatching {
+                                val manifest = BatchAudioStore(file.parentFile.toPath()).loadManifest()
+                                manifest.chunks.firstOrNull { it.index == index }?.let { chunk ->
+                                    readValidAlignment(file.parentFile.toPath(), chunk, fullDurationSeconds)
+                                }
+                            }.getOrNull()
+                        }
+                        val windowStartSeconds = startSample.toFloat() / batchPlaybackSampleRate.coerceAtLeast(1)
+                        _batchState.update {
+                            it.copy(
+                                playingChunkIndex = chunkIndex,
+                                chunkPlaybackPositionSeconds = 0f,
+                                chunkPlaybackDurationSeconds = batchPlaybackPcm.size / 2f / batchPlaybackSampleRate,
+                                playingChunkWindowPrefix = prefix,
+                                playingChunkWindowStartSeconds = windowStartSeconds,
+                                playingChunkAlignment = alignment
+                            )
+                        }
+                        val info = DataLine.Info(SourceDataLine::class.java, target)
+                        val mixer = findWorkingMixer(target)
+                        line = (mixer?.getLine(info) ?: AudioSystem.getLine(info)) as SourceDataLine
+                        playbackLine = line
+                        line!!.open(target, playbackBufferBytes(target, 24_000))
+                         line!!.start()
+                         _uiState.update { it.copy(isPlaying = true) }
+                         val buffer = ByteArray(PLAYBACK_CHUNK_SAMPLES * 2)
+                         var writePositionSample = 0
+                         while (isActive) {
+                             batchPlaybackRequestedSample?.let { requested ->
+                                 writePositionSample = requested.coerceIn(0, batchPlaybackPcm.size / 2)
+                                 batchPlaybackPositionSample = writePositionSample
+                                 batchPlaybackRequestedSample = null
+                                 line!!.flush()
+                             }
+                             if (writePositionSample * 2 >= batchPlaybackPcm.size) break
+                             val bytes = minOf(buffer.size, batchPlaybackPcm.size - writePositionSample * 2)
+                             batchPlaybackPcm.copyInto(buffer, 0, writePositionSample * 2, writePositionSample * 2 + bytes)
+                             line!!.write(buffer, 0, bytes)
+                             writePositionSample += bytes / 2
+                             batchPlaybackPositionSample = writePositionSample
+                             _batchState.update { it.copy(chunkPlaybackPositionSeconds = writePositionSample.toFloat() / batchPlaybackSampleRate) }
+                         }
+                         if (isActive) {
+                             line!!.drain()
+                             batchPlaybackPositionSample = batchPlaybackPcm.size / 2
+                             _batchState.update { it.copy(chunkPlaybackPositionSeconds = it.chunkPlaybackDurationSeconds) }
+                         }
+                    }
+                }
+            } catch (error: Throwable) {
+                _batchState.update { it.copy(error = "Playback failed: ${error.message ?: "unknown error"}") }
+            } finally {
+                runCatching { line?.stop() }; runCatching { line?.flush() }; runCatching { line?.close() }
+                if (playbackLine == line) playbackLine = null
+                _uiState.update { it.copy(isPlaying = false) }
+                _batchState.update { it.copy(playingChunkIndex = null, chunkPlaybackPositionSeconds = 0f, chunkPlaybackDurationSeconds = 0f, playingChunkWindowPrefix = null, playingChunkWindowStartSeconds = 0f, playingChunkAlignment = null) }
+            }
+        }
+    }
+
+    fun seekBatchChunk(chunkIndex: Int, positionSeconds: Float) {
+        if (_batchState.value.playingChunkIndex == chunkIndex) {
+            batchPlaybackRequestedSample = (positionSeconds.coerceAtLeast(0f) * batchPlaybackSampleRate).toInt()
+            _batchState.update { it.copy(chunkPlaybackPositionSeconds = positionSeconds.coerceIn(0f, it.chunkPlaybackDurationSeconds)) }
+        }
+    }
+
+    fun stopBatchChunk() {
+        stopPlayback(resetPosition = true)
+        batchPlaybackRequestedSample = null
+        _batchState.update { it.copy(playingChunkIndex = null, chunkPlaybackPositionSeconds = 0f, chunkPlaybackDurationSeconds = 0f, playingChunkWindowPrefix = null, playingChunkWindowStartSeconds = 0f, playingChunkAlignment = null) }
     }
 
     fun togglePlayback() {

@@ -24,12 +24,12 @@ class BatchMemoryPolicyTest {
             totalRamBytes = 32L * 1024 * 1024 * 1024
         )
         val constrained = BatchMemorySnapshot(
-            backend = QwenEngine.BackendMemory(256L * 1024 * 1024, 12L * 1024 * 1024 * 1024),
-            freeRamBytes = 256L * 1024 * 1024,
+            backend = QwenEngine.BackendMemory(128L * 1024 * 1024, 12L * 1024 * 1024 * 1024),
+            freeRamBytes = 128L * 1024 * 1024,
             totalRamBytes = 32L * 1024 * 1024 * 1024
         )
 
-        assertEquals(5_000, BatchMemoryPolicy.maxCharacters(ample))
+        assertEquals(4_000, BatchMemoryPolicy.maxCharacters(ample))
         assertTrue(BatchMemoryPolicy.maxCharacters(constrained) < 5_000)
         assertEquals(null, BatchMemoryPolicy.plan(constrained).maxCharacters)
         assertTrue(BatchMemoryPolicy.plan(constrained).reason.orEmpty().contains("minimum"))

@@ -25,7 +25,9 @@ object BatchMemoryPolicy {
     private const val MIN_CHARACTERS = 800
     private const val UNKNOWN_MEMORY_CHARACTERS = 1_600
     private const val MAX_SAFE_CHARACTERS = 5_000
+    private const val SAFE_BATCH_CHARACTERS = 4_000
     private const val MAX_AUDIO_TOKENS = 4_096
+    private const val SAFE_AUDIO_TOKENS = 3_584
     private const val AUDIO_SAMPLES_PER_TOKEN = 1_920
     private const val FLOAT_BYTES = 4L
     private const val PCM_BYTES_PER_SAMPLE = 2L
@@ -70,21 +72,23 @@ object BatchMemoryPolicy {
             )
         }
         var low = MIN_CHARACTERS
-        var high = MAX_SAFE_CHARACTERS
+        var high = minOf(MAX_SAFE_CHARACTERS, SAFE_BATCH_CHARACTERS)
         while (low < high) {
             val candidate = (low + high + 1) / 2
             if (estimatedPeakBytes(candidate) <= peakBudget) low = candidate else high = candidate - 1
         }
         return BatchMemoryPlan(
-            maxCharacters = low.coerceIn(MIN_CHARACTERS, MAX_SAFE_CHARACTERS),
+            maxCharacters = low.coerceIn(MIN_CHARACTERS, high),
             observedBudgetBytes = peakBudget
         )
     }
 
-    /** Leaves enough headroom for natural speech expansion without reserving 4096 for every chunk. */
+    /** Leaves headroom below the native 4096-token ceiling for natural speech expansion. */
     fun maxAudioTokens(text: String): Int =
-        ceil(text.length * MAX_AUDIO_TOKENS * 2.25 / 5_000.0)
-            .toInt().coerceIn(512, MAX_AUDIO_TOKENS)
+        ceil(text.length * SAFE_AUDIO_TOKENS / SAFE_BATCH_CHARACTERS.toDouble())
+            .toInt().coerceIn(512, SAFE_AUDIO_TOKENS)
+
+    fun maxAudioSamples(text: String): Long = maxAudioTokens(text).toLong() * AUDIO_SAMPLES_PER_TOKEN
 
     /**
      * Estimates the peak host-side bytes for one generation while the previous
@@ -93,8 +97,8 @@ object BatchMemoryPolicy {
      */
     fun estimatedPeakBytes(characterCount: Int): Long {
         require(characterCount >= 0) { "characterCount must not be negative" }
-        val audioTokens = ceil(characterCount * MAX_AUDIO_TOKENS * 2.25 / 5_000.0)
-            .toLong().coerceIn(512L, MAX_AUDIO_TOKENS.toLong())
+        val audioTokens = ceil(characterCount * SAFE_AUDIO_TOKENS / SAFE_BATCH_CHARACTERS.toDouble())
+            .toLong().coerceIn(512L, SAFE_AUDIO_TOKENS.toLong())
         val samples = audioTokens * AUDIO_SAMPLES_PER_TOKEN
         val generatedBytes = samples * FLOAT_BYTES * GENERATED_BUFFERS_AT_PEAK
         val persistenceBytes = samples * PCM_BYTES_PER_SAMPLE * PERSISTENCE_BUFFERS_AT_PEAK

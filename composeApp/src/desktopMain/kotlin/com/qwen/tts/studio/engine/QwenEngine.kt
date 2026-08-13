@@ -114,6 +114,10 @@ class QwenEngine {
     fun supportsReusableBufferedSession(): Boolean =
         executionMode() == QwenEngineExecutionMode.Native
 
+    /** Exact native BPE count for the TTS-formatted prompt, or -1 when unavailable. */
+    fun textTokenCount(text: String): Int =
+        if (nativePtr == 0L) -1 else nativeTextTokenCount(nativePtr, text)
+
     /** Returns active backend memory when the native build exposes it. */
     fun backendMemory(): BackendMemory? {
         if (nativePtr == 0L) return null
@@ -426,6 +430,7 @@ class QwenEngine {
     private external fun nativeInit(): Long
     private external fun nativeFree(ptr: Long)
     private external fun nativeLoadModels(ptr: Long, modelDir: String, modelName: String?): Boolean
+    private external fun nativeTextTokenCount(ptr: Long, text: String): Int
     private external fun nativeLoadIclPromptEncoder(ptr: Long, modelDir: String, modelName: String?): Boolean
     private external fun nativeSetBackendPreference(preference: Int): Boolean
     private external fun nativeGetCompiledBackendMask(): Int

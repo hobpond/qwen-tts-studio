@@ -73,6 +73,102 @@ class BatchAudioTest {
     }
 
     @Test
+    fun alignmentSidecarRoundTripsAndRejectsStaleAudioOrText() {
+        val root = Files.createTempDirectory("batch-alignment")
+        val store = BatchAudioStore(root)
+        val text = "First sentence. Second sentence."
+        val manifest = store.writeChunk(store.createManifest("alignment", 1), 0, GeneratedAudio(FloatArray(24_000), 24_000), text)
+        val alignment = BatchChunkAlignment(
+            textSha256 = sha256Text(text),
+            wavSha256 = manifest.chunks.single().sha256!!,
+            sampleRate = 24_000,
+            durationSeconds = 1f,
+            quality = "APPROXIMATE",
+            method = "test",
+            spans = listOf(
+                BatchAlignmentSpan(0, 15, 0f, 0.45f, 0.55f),
+                BatchAlignmentSpan(16, text.length, 0.45f, 1f, 0.55f)
+            )
+        )
+        store.writeAlignment(0, alignment)
+
+        assertEquals(alignment, readValidAlignment(root, manifest.chunks.single(), 1f))
+        assertEquals(null, readValidAlignment(root, manifest.chunks.single().copy(text = "changed"), 1f))
+        assertEquals(null, readValidAlignment(root, manifest.chunks.single().copy(sha256 = "stale"), 1f))
+        assertEquals(null, readValidAlignment(root, manifest.chunks.single(), 1.4f))
+    }
+
+    @Test
+    fun validationOutcomeRoundTripsInManifest() {
+        val root = Files.createTempDirectory("batch-validation-state")
+        val store = BatchAudioStore(root)
+        val manifest = store.writeChunk(
+            store.createManifest("validation-state", 1),
+            0,
+            GeneratedAudio(FloatArray(24_000), 24_000),
+            "validated text"
+        ).copy(chunks = store.loadManifest().chunks.map {
+            it.copy(
+                validationPassed = false,
+                validationMessage = "ASR suffix mismatch",
+                validationSignature = BatchValidationSignature.forChunk(it)
+            )
+        })
+        store.persistManifest(manifest)
+
+        val reloaded = store.loadManifest()
+        assertEquals(false, reloaded.chunks.single().validationPassed)
+        assertEquals("ASR suffix mismatch", reloaded.chunks.single().validationMessage)
+        assertEquals(BatchValidationSignature.forChunk(reloaded.chunks.single()), reloaded.chunks.single().validationSignature)
+    }
+
+    @Test
+    fun validationSignatureChangesWhenChunkInputsChange() {
+        val chunk = BatchChunk(
+            index = 0,
+            fileName = "chunk-000000.wav",
+            text = "Transcript",
+            voiceName = "vivian",
+            modelName = "model.gguf",
+            voicePrompt = "Calm"
+        )
+        val signature = BatchValidationSignature.forChunk(chunk)
+
+        assertEquals(true, BatchValidationSignature.matches(chunk.copy(validationSignature = signature)))
+        assertEquals(false, BatchValidationSignature.matches(chunk.copy(text = "Changed", validationSignature = signature)))
+        assertEquals(false, BatchValidationSignature.matches(chunk.copy(modelName = "other.gguf", validationSignature = signature)))
+        assertEquals(false, BatchValidationSignature.matches(chunk.copy(voicePrompt = "Bright", validationSignature = signature)))
+        assertEquals(false, BatchValidationSignature.matches(chunk.copy(voiceName = "other", validationSignature = signature)))
+    }
+
+    @Test
+    fun manifestRetainsPerChunkVoiceModelAndPromptAcrossWriteAndReload() {
+        val root = Files.createTempDirectory("batch-config-reload")
+        val store = BatchAudioStore(root)
+        val configured = store.createManifest("config", 1).withChunk(
+            BatchChunk(
+                index = 0,
+                fileName = "chunk-000000.wav",
+                text = "configured text",
+                voiceName = "Ryan",
+                modelName = "qwen-talker-1.7b-customvoice-Q8_0.gguf",
+                voicePrompt = "Warm, measured delivery"
+            )
+        )
+        val written = store.writeChunk(configured, 0, GeneratedAudio(floatArrayOf(0f), 24_000), "configured text")
+        val loaded = store.loadManifest()
+
+        assertEquals(written.chunks.single().voiceName, loaded.chunks.single().voiceName)
+        assertEquals(written.chunks.single().modelName, loaded.chunks.single().modelName)
+        assertEquals(written.chunks.single().voicePrompt, loaded.chunks.single().voicePrompt)
+
+        val resumed = store.createOrResumeManifest("new-ui-run", listOf("configured text"))
+        assertEquals("Ryan", resumed.chunks.single().voiceName)
+        assertEquals("qwen-talker-1.7b-customvoice-Q8_0.gguf", resumed.chunks.single().modelName)
+        assertEquals("Warm, measured delivery", resumed.chunks.single().voicePrompt)
+    }
+
+    @Test
     fun resumesOnlyValidChunksFromCompatibleManifest() {
         val root = Files.createTempDirectory("batch-resume")
         val store = BatchAudioStore(root)
@@ -180,6 +276,24 @@ class BatchAudioTest {
 
         assertEquals(BatchChunkStatus.PENDING, generated.chunks.single().status)
         assertEquals("new text", Files.readString(root.resolve("chunk-000000.txt")))
+    }
+
+    @Test
+    fun freshTextManifestPersistsBatchVoiceDefaultsOnEveryChunk() {
+        val root = Files.createTempDirectory("batch-voice-defaults")
+        val generated = BatchAudioStore(root).generateManifestFromTexts(
+            batchId = "voice-defaults",
+            texts = listOf("first", "second"),
+            defaultVoiceName = "vivian",
+            defaultModelName = "qwen-talker-custom.gguf",
+            defaultVoicePrompt = "calm"
+        )
+
+        assertEquals(listOf("vivian", "vivian"), generated.chunks.map { it.voiceName })
+        assertEquals(listOf("qwen-talker-custom.gguf", "qwen-talker-custom.gguf"), generated.chunks.map { it.modelName })
+        assertEquals(listOf("calm", "calm"), generated.chunks.map { it.voicePrompt })
+        val reloaded = BatchAudioStore(root).loadManifest()
+        assertEquals(generated.chunks.map { it.voiceName }, reloaded.chunks.map { it.voiceName })
     }
 
     @Test

@@ -55,6 +55,16 @@ class BatchValidationTest {
     }
 
     @Test
+    fun localScoringAcceptsFiveSecondPrefixWithMinorAsrSpellingDifferences() {
+        val expected = "A gardener's touch, Part I. Grenville McKree was born too big; the seventh son was born to Margaret McKree."
+        val transcript = "The gardener's touch. Part I. Granville McCree was born."
+
+        val result = BatchAsrValidator.compare(expected, transcript, AsrWindow.PREFIX)
+
+        assertTrue(result.similarity >= 0.75, "prefix score=${result.similarity}")
+    }
+
+    @Test
     fun failedTranscriptionStillReturnsReviewableExpectedSegment() {
         val root = Files.createTempDirectory("batch-asr-error")
         val store = BatchAudioStore(root)
@@ -104,5 +114,39 @@ class BatchValidationTest {
         assertTrue(report.passed)
         assertTrue(report.findings.none { it.code == "TEXT_MANIFEST_MISMATCH" })
         assertTrue(report.findings.none { it.code == "SOURCE_ROUND_TRIP_FAILED" })
+    }
+
+    @Test
+    fun deterministicValidationIgnoresSynthesisWhitespaceCleanup() {
+        val root = Files.createTempDirectory("batch-cleaned-whitespace")
+        val store = BatchAudioStore(root)
+        val source = "  First   line.\r\n\r\n\tSecond\tline.  "
+        val manifest = store.generateManifestFromTexts("cleaned-whitespace", listOf(source))
+        Files.writeString(root.resolve("chunk-000000.txt"), "First line.\nSecond line.")
+
+        val report = BatchValidator.validate(store, manifest, source)
+
+        assertTrue(report.passed)
+        assertTrue(report.findings.none { it.code == "TEXT_MANIFEST_MISMATCH" })
+        assertTrue(report.findings.none { it.code == "SOURCE_ROUND_TRIP_FAILED" })
+    }
+
+    @Test
+    fun deterministicValidationFlagsAudioThatIsTooShortForItsText() {
+        val root = Files.createTempDirectory("batch-audio-too-short")
+        val store = BatchAudioStore(root)
+        val text = "A deliberately long chunk of text that cannot be represented by a single sample. " +
+            "The validator must identify this as an implausibly short audio result."
+        val manifest = store.writeChunk(
+            store.createManifest("audio-too-short", 1),
+            0,
+            GeneratedAudio(FloatArray(24_000), 24_000),
+            text
+        )
+
+        val report = BatchValidator.validate(store, manifest)
+
+        assertTrue(report.errors.any { it.code == "AUDIO_TOO_SHORT" })
+        assertTrue(report.errors.single { it.code == "AUDIO_TOO_SHORT" }.message.contains("bytes"))
     }
 }

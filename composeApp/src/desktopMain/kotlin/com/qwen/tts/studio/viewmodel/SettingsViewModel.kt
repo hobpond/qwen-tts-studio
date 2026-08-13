@@ -24,7 +24,8 @@ import java.util.prefs.Preferences
 data class ModelDownloadFile(
     val fileName: String,
     val url: String,
-    val sizeBytes: Long
+    val sizeBytes: Long,
+    val refreshWhenSourceChanges: Boolean = false
 )
 
 data class ModelDownloadOption(
@@ -58,10 +59,13 @@ class SettingsViewModel : ViewModel() {
         const val HUGGING_FACE_REPO_URL = "https://huggingface.co/$HUGGING_FACE_REPO/tree/main"
         private const val TOKENIZER_Q8 = "qwen-tokenizer-12hz-Q8_0.gguf"
         const val ASR_MODEL_NAME = "qwen3-asr-0.6b-q8_0.gguf"
+        /** Exact filename emitted by the Jaffe2718 GGUF conversion used by qwen3-asr.cpp. */
+        const val FORCED_ALIGNER_MODEL_NAME = "qwen3-forcedaligner-0.6b-f16.gguf"
 
         private val fileSizes = mapOf(
             TOKENIZER_Q8 to 291_150_624L,
             ASR_MODEL_NAME to 1_010_000_000L,
+            FORCED_ALIGNER_MODEL_NAME to 1_800_000_000L,
             "qwen-talker-0.6b-base-Q8_0.gguf" to 992_615_488L,
             "qwen-talker-1.7b-base-Q8_0.gguf" to 2_079_448_256L,
             "qwen-talker-1.7b-customvoice-Q8_0.gguf" to 2_042_834_304L,
@@ -115,6 +119,13 @@ class SettingsViewModel : ViewModel() {
                 description = "Native GGUF speech recognition for batch validation.",
                 primaryModelName = ASR_MODEL_NAME,
                 files = listOf(asrFile(ASR_MODEL_NAME))
+            ),
+            ModelDownloadOption(
+                id = "qwen3-forced-aligner-0.6b-f16",
+                title = "Qwen3 Forced Aligner 0.6B F16",
+                description = "Native word-level timing model for batch playback alignment.",
+                primaryModelName = FORCED_ALIGNER_MODEL_NAME,
+                files = listOf(asrFile(FORCED_ALIGNER_MODEL_NAME))
             )
         )
 
@@ -124,8 +135,9 @@ class SettingsViewModel : ViewModel() {
         private fun asrFile(fileName: String): ModelDownloadFile =
             ModelDownloadFile(
                 fileName,
-                "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/$fileName?download=true",
-                fileSizes[fileName] ?: 0L
+                "https://huggingface.co/Jaffe2718/Qwen3-ASR-GGUF/resolve/main/$fileName?download=true",
+                1_350_000_000L,
+                refreshWhenSourceChanges = true
             )
     }
 
@@ -468,7 +480,13 @@ class SettingsViewModel : ViewModel() {
     ): Long {
         return withContext(Dispatchers.IO) {
             val target = File(targetDir, file.fileName)
-            if (target.exists() && target.length() > 0L) {
+            val sourceMarker = File(targetDir, "${file.fileName}.source")
+            val isExpectedSource = sourceMarker.isFile && runCatching {
+                sourceMarker.readText(Charsets.UTF_8).trim() == file.url
+            }.getOrDefault(false)
+            if (target.exists() && target.length() > 0L &&
+                (!file.refreshWhenSourceChanges || isExpectedSource)
+            ) {
                 val completedBytes = completedBytesBefore + file.sizeBytes.coerceAtLeast(target.length())
                 _downloadState.value = ModelDownloadState(
                     isDownloading = true,
@@ -514,6 +532,9 @@ class SettingsViewModel : ViewModel() {
                 }
             }
             java.nio.file.Files.move(part.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            if (file.refreshWhenSourceChanges) {
+                sourceMarker.writeText(file.url, Charsets.UTF_8)
+            }
             val completedBytes = completedBytesBefore + effectiveFileSize.coerceAtLeast(target.length())
             _downloadState.value = ModelDownloadState(
                 isDownloading = true,

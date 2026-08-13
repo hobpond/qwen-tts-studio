@@ -38,7 +38,13 @@ data class BatchChunk(
     val sampleRate: Int? = null,
     val frameCount: Long? = null,
     val sha256: String? = null,
-    val error: String? = null
+    val error: String? = null,
+    val voiceName: String? = null,
+    val modelName: String? = null,
+    val voicePrompt: String? = null,
+    val validationPassed: Boolean? = null,
+    val validationMessage: String? = null,
+    val validationSignature: String? = null
 )
 
 data class BatchManifest(
@@ -89,7 +95,11 @@ open class BatchAudioStore(directory: Path) {
             require(index == expectedIndex) { "Chunk sidecars must be contiguous starting at chunk-000000.txt" }
             val text = Files.readString(textFile, StandardCharsets.UTF_8)
             val wavFile = safeChild(chunkFileName(index))
-            val base = BatchChunk(index, chunkFileName(index), text)
+            val previous = existing?.chunks?.firstOrNull { it.index == index }
+            val base = BatchChunk(index, chunkFileName(index), text,
+                voiceName = previous?.voiceName,
+                modelName = previous?.modelName,
+                voicePrompt = previous?.voicePrompt)
             provenComplete(existing?.chunks?.firstOrNull { it.index == index }, text, wavFile, index)
                 ?.let { parsed ->
                     base.copy(status = BatchChunkStatus.COMPLETE, sampleRate = parsed.sampleRate,
@@ -104,7 +114,10 @@ open class BatchAudioStore(directory: Path) {
     fun generateManifestFromTexts(
         batchId: String,
         texts: List<String>,
-        metadata: Map<String, String> = emptyMap()
+        metadata: Map<String, String> = emptyMap(),
+        defaultVoiceName: String? = null,
+        defaultModelName: String? = null,
+        defaultVoicePrompt: String? = null
     ): BatchManifest {
         require(texts.isNotEmpty()) { "No source chunks were supplied" }
         val existing = existingManifest()
@@ -117,7 +130,11 @@ open class BatchAudioStore(directory: Path) {
         val chunks = texts.mapIndexed { index, text ->
             val fileName = chunkFileName(index)
             val wavFile = safeChild(fileName)
-            val base = BatchChunk(index, fileName, text)
+            val previous = existing?.chunks?.firstOrNull { it.index == index }
+            val base = BatchChunk(index, fileName, text,
+                voiceName = previous?.voiceName ?: defaultVoiceName,
+                modelName = previous?.modelName ?: defaultModelName,
+                voicePrompt = previous?.voicePrompt ?: defaultVoicePrompt)
             provenComplete(existing?.chunks?.firstOrNull { it.index == index }, text, wavFile, index)
                 ?.let { parsed ->
                     base.copy(status = BatchChunkStatus.COMPLETE, sampleRate = parsed.sampleRate,
@@ -178,7 +195,10 @@ open class BatchAudioStore(directory: Path) {
             // A stale WAV is not evidence of a completed chunk. Only a chunk that
             // was durably marked COMPLETE for the same source text may be resumed.
             if (previous?.status != BatchChunkStatus.COMPLETE || previous.text != text || !Files.isRegularFile(file)) {
-                return@mapIndexed BatchChunk(index, fileName, text)
+                return@mapIndexed BatchChunk(index, fileName, text,
+                    voiceName = previous?.voiceName,
+                    modelName = previous?.modelName,
+                    voicePrompt = previous?.voicePrompt)
             }
             runCatching {
                 val wav = Files.readAllBytes(file)
@@ -189,7 +209,10 @@ open class BatchAudioStore(directory: Path) {
                         fileName,
                         text,
                         BatchChunkStatus.PENDING,
-                        error = "Existing WAV checksum mismatch; regeneration required"
+                        error = "Existing WAV checksum mismatch; regeneration required",
+                        voiceName = previous.voiceName,
+                        modelName = previous.modelName,
+                        voicePrompt = previous.voicePrompt
                     )
                 }
                 val textFile = safeChild(textFileName(index))
@@ -197,8 +220,15 @@ open class BatchAudioStore(directory: Path) {
                     writeAtomic(textFile, text.toByteArray(StandardCharsets.UTF_8))
                 }
                 BatchChunk(index, fileName, text, BatchChunkStatus.COMPLETE, parsed.sampleRate,
-                    parsed.frameCount, previous.sha256)
-            }.getOrElse { BatchChunk(index, fileName, text, error = it.message) }
+                    parsed.frameCount, previous.sha256,
+                    voiceName = previous.voiceName,
+                    modelName = previous.modelName,
+                    voicePrompt = previous.voicePrompt)
+            }.getOrElse { BatchChunk(index, fileName, text,
+                error = it.message,
+                voiceName = previous.voiceName,
+                modelName = previous.modelName,
+                voicePrompt = previous.voicePrompt) }
         }
         return BatchManifest(batchId, texts.size, resumed, metadata).also(::persistManifest)
     }
@@ -212,9 +242,15 @@ open class BatchAudioStore(directory: Path) {
                 index = index,
                 fileName = existing?.fileName ?: chunkFileName(index),
                 text = text,
-                status = BatchChunkStatus.PENDING
+                status = BatchChunkStatus.PENDING,
+                voiceName = existing?.voiceName,
+                modelName = existing?.modelName,
+                voicePrompt = existing?.voicePrompt
             )
-        ).also(::persistManifest)
+        ).also {
+            deleteAlignment(index)
+            persistManifest(it)
+        }
     }
 
     fun writeChunk(manifest: BatchManifest, index: Int, audio: GeneratedAudio, text: String = ""): BatchManifest {
@@ -222,32 +258,72 @@ open class BatchAudioStore(directory: Path) {
         return manifest.withChunk(chunk).also(::persistManifest)
     }
 
+    fun writeAlignment(index: Int, alignment: BatchChunkAlignment) {
+        require(index >= 0) { "Chunk index must not be negative" }
+        writeAtomic(alignmentPath(directory, index), BatchAlignmentCodec.encode(alignment).toByteArray(StandardCharsets.UTF_8))
+    }
+
+    fun deleteAlignment(index: Int) {
+        Files.deleteIfExists(alignmentPath(directory, index))
+    }
+
     /** Encodes and atomically writes one chunk without changing the manifest. */
     open fun writeChunkFile(manifest: BatchManifest, index: Int, audio: GeneratedAudio, text: String = ""): BatchChunk {
         require(index in 0 until manifest.expectedChunkCount) { "Chunk index is outside the batch" }
-        val fileName = manifest.chunks.firstOrNull { it.index == index }?.fileName ?: chunkFileName(index)
+        val existing = manifest.chunks.firstOrNull { it.index == index }
+        val fileName = existing?.fileName ?: chunkFileName(index)
         val target = safeChild(fileName)
         val pcm = encodePcm16(audio.samples)
         val wav = wavBytes(audio.sampleRate, pcm)
         writeAtomic(safeChild(textFileName(index)), text.toByteArray(StandardCharsets.UTF_8))
         writeAtomic(target, wav)
         return BatchChunk(index, fileName, text, BatchChunkStatus.COMPLETE, audio.sampleRate,
-            audio.samples.size.toLong(), sha256(wav))
+            audio.samples.size.toLong(), sha256(wav),
+            voiceName = existing?.voiceName,
+            modelName = existing?.modelName,
+            voicePrompt = existing?.voicePrompt)
     }
 
     fun markFailed(manifest: BatchManifest, index: Int, error: String, text: String? = null): BatchManifest =
         manifest.withChunk(BatchChunk(index, manifest.chunks.firstOrNull { it.index == index }?.fileName ?: chunkFileName(index),
             text ?: manifest.chunks.firstOrNull { it.index == index }?.text ?: "",
-            BatchChunkStatus.FAILED, error = error)).also(::persistManifest)
+            BatchChunkStatus.FAILED, error = error,
+            voiceName = manifest.chunks.firstOrNull { it.index == index }?.voiceName,
+            modelName = manifest.chunks.firstOrNull { it.index == index }?.modelName,
+            voicePrompt = manifest.chunks.firstOrNull { it.index == index }?.voicePrompt)).also {
+            deleteAlignment(index)
+            persistManifest(it)
+        }
 
     fun markCancelled(manifest: BatchManifest, index: Int): BatchManifest =
         manifest.withChunk(BatchChunk(index, manifest.chunks.firstOrNull { it.index == index }?.fileName ?: chunkFileName(index),
             manifest.chunks.firstOrNull { it.index == index }?.text ?: "",
-            BatchChunkStatus.CANCELLED, error = "Cancelled")).also(::persistManifest)
+            BatchChunkStatus.CANCELLED, error = "Cancelled",
+            voiceName = manifest.chunks.firstOrNull { it.index == index }?.voiceName,
+            modelName = manifest.chunks.firstOrNull { it.index == index }?.modelName,
+            voicePrompt = manifest.chunks.firstOrNull { it.index == index }?.voicePrompt)).also {
+            deleteAlignment(index)
+            persistManifest(it)
+        }
 
+    @Synchronized
     fun persistManifest(manifest: BatchManifest) {
         Files.createDirectories(directory)
         writeAtomic(manifestPath, manifestJson(manifest).toByteArray(StandardCharsets.UTF_8))
+    }
+
+    /**
+     * Commits a completed WAV into the newest manifest rather than a snapshot
+     * captured when generation started. The writer runs concurrently with GPU
+     * generation, so replacing the whole manifest from an old snapshot could
+     * erase newer PENDING or COMPLETE entries.
+     */
+    @Synchronized
+    fun persistCompletedChunk(chunk: BatchChunk): BatchManifest {
+        val current = loadManifest()
+        val updated = current.withChunk(chunk)
+        persistManifest(updated)
+        return updated
     }
 
     /** Verifies every manifest entry and WAV before creating the combined output. */
@@ -427,7 +503,7 @@ open class BatchAudioStore(directory: Path) {
         manifest.chunks.forEachIndexed { i, c ->
             if (i > 0) append(',')
             append("{\"index\":").append(c.index).append(",\"fileName\":\"").append(jsonEscape(c.fileName)).append("\",\"text\":\"").append(jsonEscape(c.text)).append("\",\"status\":\"").append(c.status).append('\"')
-            c.sampleRate?.let { append(",\"sampleRate\":").append(it) }; c.frameCount?.let { append(",\"frameCount\":").append(it) }; c.sha256?.let { append(",\"sha256\":\"").append(it).append('\"') }; c.error?.let { append(",\"error\":\"").append(jsonEscape(it)).append('\"') }
+             c.sampleRate?.let { append(",\"sampleRate\":").append(it) }; c.frameCount?.let { append(",\"frameCount\":").append(it) }; c.sha256?.let { append(",\"sha256\":\"").append(it).append('\"') }; c.error?.let { append(",\"error\":\"").append(jsonEscape(it)).append('\"') }; c.voiceName?.let { append(",\"voiceName\":\"").append(jsonEscape(it)).append('\"') }; c.modelName?.let { append(",\"modelName\":\"").append(jsonEscape(it)).append('\"') }; c.voicePrompt?.let { append(",\"voicePrompt\":\"").append(jsonEscape(it)).append('\"') }; c.validationPassed?.let { append(",\"validationPassed\":").append(it) }; c.validationMessage?.let { append(",\"validationMessage\":\"").append(jsonEscape(it)).append('\"') }; c.validationSignature?.let { append(",\"validationSignature\":\"").append(jsonEscape(it)).append('\"') }
             append('}')
         }
         append("]}\n")

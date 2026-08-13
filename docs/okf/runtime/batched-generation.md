@@ -32,7 +32,7 @@ Each batch can contain `manifest.json` plus paired zero-padded files such as `ch
 
 ## Batch validation
 
-The deterministic validator checks contiguous indexes, manifest/sidecar text equality, source round-trip equality when the source file is available, WAV structure/metadata/checksum, completion state, and output reaching the estimated audio-token ceiling. A cap-reaching result is a warning rather than proof of truncation. The UI exposes these findings through `Validate`.
+The deterministic validator checks contiguous indexes, manifest/sidecar text equality after the same whitespace cleanup used for synthesis, source round-trip equality after that normalization when the source file is available, WAV structure/metadata/checksum, completion state, and output reaching the estimated audio-token ceiling. Persisted manifest and sidecar text remains lossless, and exact text fingerprints still protect resume provenance. A cap-reaching result is a warning rather than proof of truncation. The UI exposes these findings through `Validate`.
 
 Probabilistic validation is represented by a `BatchAsrTranscriber` adapter and prefix/suffix comparison model. `NativeBatchAsrTranscriber` loads a Qwen3-ASR GGUF through `QwenAsrEngine`, which is compiled into the same JNI DLL and shares the application's GGML backend build. The Kotlin adapter converts generated WAV audio to the ASR model's 16 kHz mono PCM contract, crops the first and last five seconds, and sends samples directly through JNI. The ASR model is an optional managed download, so deterministic validation remains available when it is not installed; ASR errors are surfaced as validation findings rather than silently substituted.
 

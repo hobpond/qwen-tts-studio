@@ -41,9 +41,11 @@ class QwenAsrEngine private constructor(
     fun load(modelFile: File) {
         try {
             require(modelFile.isFile) { "Qwen3-ASR model not found: ${modelFile.absolutePath}" }
-            check(nativeApi?.loadModel(nativePtr, modelFile.absolutePath)
-                ?: nativeLoadModel(nativePtr, modelFile.absolutePath)) {
-                "Could not load Qwen3-ASR model: ${modelFile.absolutePath}"
+            val loaded = nativeApi?.loadModel(nativePtr, modelFile.absolutePath)
+                ?: nativeLoadModel(nativePtr, modelFile.absolutePath)
+            check(loaded) {
+                val nativeError = if (nativeApi == null) nativeGetLastError(nativePtr) else null
+                "Could not load Qwen3-ASR model: ${nativeError ?: modelFile.absolutePath}"
             }
         } catch (error: Throwable) {
             runCatching { close() }.onFailure(error::addSuppressed)
@@ -76,6 +78,7 @@ class QwenAsrEngine private constructor(
     private external fun nativeInit(): Long
     private external fun nativeFree(ptr: Long)
     private external fun nativeLoadModel(ptr: Long, modelPath: String): Boolean
+    private external fun nativeGetLastError(ptr: Long): String?
     private external fun nativeTranscribeSamples(ptr: Long, samples: FloatArray, maxTokens: Int, threads: Int): NativeResult?
 
     private fun readSamples(stream: AudioInputStream, window: AsrAudioWindow?): FloatArray {

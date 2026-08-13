@@ -6,6 +6,22 @@ import kotlin.test.assertTrue
 
 class TextBatchingTest {
     @Test
+    fun synthesisCleanupRemovesWhitespaceNoiseWithoutChangingWords() {
+        assertEquals("First line\nSecond line", TextBatching.cleanForSynthesis("  First   line\r\n\n\t Second line  "))
+    }
+
+    @Test
+    fun measuredPackingUsesTokenCounterWithoutChangingText() {
+        val source = "one two three four five six seven eight nine ten"
+        val chunks = TextBatching.packParagraphsMeasured(source, 5_000, 4) { value ->
+            value.trim().split(Regex("\\s+")).count()
+        }
+
+        assertTrue(chunks.all { it.trim().split(Regex("\\s+")).size <= 4 })
+        assertEquals(source, chunks.joinToString(""))
+    }
+
+    @Test
     fun combinesCompleteParagraphsWithoutExceedingLimit() {
         assertEquals(
             listOf("one two\n\n", "alpha beta\n\ngamma"),

@@ -254,7 +254,7 @@ class BatchGenerationTest {
         val result = BatchGenerationSession(fake, store).run(request)
 
         assertEquals(plan, generatedManifest.chunks.map { it.text })
-        assertEquals(plan, fake.generatedTexts)
+        assertEquals(plan.map(TextBatching::cleanForSynthesis), fake.generatedTexts)
         assertEquals(plan, result.manifest.chunks.map { it.text })
         assertEquals(source, result.manifest.chunks.joinToString(separator = "") { it.text })
     }

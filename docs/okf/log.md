@@ -1,13 +1,69 @@
 # OKF Update Log
 
+## 2026-08-13
+
+* **Fix**: Batch chunk seeking now uses the local playback write cursor after an audio-device flush, and per-chunk regeneration now prioritizes the manifest's persisted model, prompt, and voice identity instead of current Studio defaults.
+* **Fix**: Batch manifest loading and refresh now rebuild the replay request, per-chunk voice parameters, batch defaults, row validation state, and result snapshot from the external manifest; Batch screen lifecycle polling observes atomic manifest writes from generation, validation, or another process.
+* **Fix**: Loaded CustomVoice manifests now provide their persisted speaker directly to every batch request path, include that voice in row options before capability probing completes, and probe manifest-selected models automatically after load.
+* **Fix**: Batch UI state now reloads the durable manifest after generation and validation, updating the active manifest, completed result snapshot, and signature-valid validation indicators together across lifecycle boundaries.
+* **Persistence**: Batch validation results now store a per-chunk SHA-256 signature over model, voice prompt, voice, and transcript. Loaded results are ignored when that signature is missing or no longer matches the chunk inputs.
+
+## 2026-08-12
+
+* **Fix**: Batch generation now retries long chunks at 95% of their safe audio budget, not only after reaching the exact ceiling. Native output can stop slightly below the ceiling while still clipping the final sentence; sentence-boundary recombination now catches that case before persistence.
+* **Fix**: ASR edge validation now accepts a naturally completed five-second prefix even when it contains fewer than the 160-character comparison target and has minor spelling/article differences from the transcript. It still requires a contiguous four-word edge match, keeping unrelated speech below the threshold.
+* **Fix**: Batch generation now queries named-speaker capabilities after loading each selected model, uses the first available model speaker when a request omitted one, and fails before native synthesis with an actionable message when CustomVoice has no resolvable voice input.
+
+## 2026-08-11
+
+* **Fix**: Batch CustomVoice requests now carry the selected named speaker even when the row display name is `Default Voice`; loaded manifests also preserve their persisted speaker identity instead of sending a speaker-less request to native synthesis.
+* **Fix**: Deterministic batch validation now applies the synthesis whitespace cleanup when comparing manifest, sidecar, and source text, preventing harmless extra spaces, trimmed edges, and normalized line breaks from producing false failures while preserving lossless persisted text and exact resume fingerprints.
+* **UX**: Loaded manifests now expose an explicit `Resume batch` operation that preserves completed chunks and continues generation from the next unfinished or invalid chunk without regenerating completed audio.
+* **Fix**: Batch planning now reserves 12.5% below the native audio-token ceiling, limits new chunks to a calibrated 4,000 characters, and validates WAV sample frames against token-expanded sample capacity rather than comparing incompatible units. Existing manifests above the safe limit must be regenerated or explicitly split before replay.
+* **Implementation**: Exposed the native Qwen BPE tokenizer count through the existing JNI/DLL boundary and used it for measured input chunking at a 2,048-token budget. Added sentence-boundary audio-budget retry that regenerates over two smaller text spans and concatenates the audio before persistence when the safe audio budget is reached.
+* **Implementation**: Added a synthesis-only whitespace cleanup pass that collapses repeated spaces/tabs, reduces newline runs, and trims chunk edges while keeping manifest text and sidecars lossless for validation and replay.
+* **Persistence**: Stored per-chunk validation pass/fail state and review message in `manifest.json`; loading restores those indicators, while regenerated or reconfigured chunks clear stale validation state.
+* **UX**: Pipelined batch progress now advances on generated audio as well as durable persistence; the UI shows separate generated and complete counts so CPU-side overlap cannot appear stalled.
+* **Fix**: Background WAV persistence now immediately commits the matching `COMPLETE` chunk to `manifest.json` and publishes that snapshot to the batch UI; manifest progress no longer waits for the next GPU generation to finish.
+* **Fix**: Completed-chunk persistence now merges with the latest manifest under the store lock, preventing a background writer from overwriting newer chunk progress.
+* **Diagnostics**: Batch persistence now logs writer start, completion, exact WAV/manifest paths, and failures separately from native synthesis timing.
+* **Diagnostics**: Batch alignment and persistence diagnostics now include ISO-8601 local timestamps so inference, writing, and manifest commits can be compared chronologically.
+* **Fix**: Generate Manifest now persists the selected batch voice, model, and prompt as defaults on each new chunk while retaining explicit per-chunk overrides during rescans.
+* **Fix**: Selecting a batch source file or output directory no longer clears the configured batch voice, model, or prompt before manifest generation.
+
+## 2026-08-10
+
+* **UX**: Per-chunk generation now keeps the row action in place and changes it to an hourglass `Generating…` state for the active chunk, matching validation feedback instead of removing/reflowing row controls.
+* **UX**: Batch rows now place the M/P configuration control before the voice selector and shorten the display-only `Default Voice (Model)` label to `Default Voice` without changing persisted voice identity.
+* **UX**: Validation detail popovers now show only failed findings and present ASR failures as explicit Expected versus Actual values; passing prefix/suffix checks are omitted from the failure review.
+* **Setup**: Added the Qwen3 Forced Aligner 0.6B F16 download as a separate model option using the exact `qwen3-forcedaligner-0.6b-f16.gguf` filename and Jaffe2718 GGUF source required by the bundled `qwen3-asr.cpp` tests. Source markers enable replacement of stale/incompatible files.
+* **Implementation**: Batch playback now uses native TTS streaming text spans when available, persists checksum-guarded approximate alignment sidecars, rejects stale/non-monotonic alignment, labels missing estimates honestly, and reports device-clock/sidecar instrumentation. Playback position is derived from frames played by the audio device rather than frames queued.
+* **UX**: Moved Batch operations directly above Batch parts and promoted batch workspace state into the shared view model so changing tabs retains the loaded manifest, replay request, selections, and progress state.
+* **UX**: Added top-level Batch operations for validating all loaded chunks in one serialized deterministic/ASR pass and regenerating all chunks using their persisted per-chunk voice, model, and prompt settings.
+* **UX**: Batch rows now show `SAVING` when a generated chunk is awaiting durable WAV/manifest persistence while the next chunk is being synthesized, making CPU-side pipeline progress visible before the chunk becomes `COMPLETE`.
+* **Validation**: Deterministic batch validation now reports WAVs that are implausibly short for substantial chunk text, includes file size/duration evidence, and treats reaching the audio-token ceiling as a likely truncation error. Added regression coverage.
+
 ## 2026-08-09
 
+* **Fix**: Batch manifest reload/resume now preserves each chunk's voice, model, and voice prompt while replacing audio/status metadata, including regeneration, failure, cancellation, and manifest rescans. Added a desktop regression test for write/reload/resume round-tripping.
 * **Fix**: Batch validation presentation now renders every ASR prefix/suffix finding with chunk, expected text, transcript, score, pass/fail, and error details. The Batch screen also serializes validation against generation/recombination through screen-local job state, preventing validation reads from racing active batch file writes while preserving view-model ownership of workflow work.
 * **Documentation**: Refreshed native-boundary concepts to reflect the populated TTS/ASR source submodules and clarified that CPU persistence overlap remains distinct from validation actions.
 * **UX**: Moved batch generation out of the Synthesis view into a dedicated Batch navigation tab. The batch workflow keeps its existing manifest, resume, regeneration, validation, and recombination state through the shared Studio view model.
 * **UX**: ASR validation now resolves the standard Qwen3-ASR GGUF from the Setup-managed model directory; Batch no longer asks users to browse for an ASR model.
 
 * **Implementation**: Replaced the external-process ASR validation adapter with an in-process Qwen3-ASR GGUF runtime. The ASR source is a pinned native submodule, links into the existing JNI DLL/GGML build, and is downloaded through the normal model-management UI. Prefix/suffix validation now converts and crops WAV samples before calling native JNI.
+* **2026-08-09 — ASR model source**: Corrected Setup's ASR download from the CrispASR conversion to the Jaffe2718 GGUF conversion used by the bundled `qwen3-asr.cpp` tests. Downloads now record their source URL and replace stale files whose marker does not match, preventing an incompatible pre-existing ASR file from being silently reused.
+* **2026-08-09 — Batch manifest table**: Loaded manifests now expose per-chunk playback and one validation action. The action combines deterministic checks with ASR when installed, and the row records running/pass/fail state instead of requiring separate whole-manifest validation buttons.
+* **2026-08-09 — Batch playback controls**: Per-chunk playback now buffers decoded PCM for seekable playback and exposes a row-local position slider and Stop action.
+* **2026-08-09 — Validation details**: Per-chunk validation explanations and ASR transcripts are now opened from the row's pass/fail icon instead of rendered as a separate details section below the table.
+* **2026-08-09 — Per-chunk voices**: Batch manifests now persist a voice name on every chunk. The batch table can assign voices independently, changing an assignment invalidates that chunk, and replay generation resolves the selected voice's native speaker or conditioning artifact per chunk.
+* **2026-08-09 — Explicit batch identity controls**: Batch now exposes model selection and an optional voice prompt. These values are carried into the batch identity metadata and restored when a manifest is loaded.
+* **2026-08-09 — Chunk review controls**: Each completed chunk now has quick prefix and suffix playback actions, and a text popover for reading the complete chunk without widening the table.
+* **2026-08-09 — Batch progress placement**: Overall batch operation status is now shown beside the top-level progress, while the active chunk row shows its own generation indicator.
+* **2026-08-09 — In-flight generation UX**: Generation now exposes the same explicit inline busy notice used by validation, explaining why batch edits and file actions are temporarily paused.
+* **2026-08-09 — Per-chunk model and prompt**: Model selection and voice prompt moved into each chunk's configuration popover. Manifest chunks now persist `modelName` and `voicePrompt`; generation reloads the native session when consecutive chunks select different models.
+* **2026-08-09 — Model-specific default voices**: Batch now probes a row's selected model for named speakers using the same native capability path as Studio, so CustomVoice defaults appear even when the Studio-active model is a different variant.
+* **2026-08-09 — Chunk playback highlighting**: The chunk text popover now highlights playback progress for full, prefix, and suffix playback using the existing batch audio position state.
 * **Verification**: Kotlin desktop tests pass. Native CPU configuration compiled the ASR sources and linked `qwen3_tts.dll`; copying the rebuilt DLL was deferred because the repository-root DLL was locked by a running application.
 
 ## 2026-08-08
@@ -88,3 +144,6 @@
 * **Implementation**: Added deterministic batch validation for text conservation, manifest/sidecar agreement, WAV integrity, completion state, and possible audio-token-cap truncation. Added the probabilistic Qwen-ASR adapter contract for prefix/suffix similarity without claiming ASR support is installed.
 * **Implementation**: Added an external-process Qwen ASR adapter with bounded execution and `{wav}`/`{window}` placeholders, allowing prefix/suffix probabilistic checks to run against an installed ASR wrapper without embedding a second inference runtime.
 * **Refactor**: Moved all batch-generation presentation into the dedicated `BatchScreen`; `StudioScreen` now contains synthesis-only controls while the shared `StudioViewModel` preserves batch state across tabs.
+* **UX**: Moved batch progress, elapsed-time estimate, operation status, and the generation lock notice immediately above Batch operations and Batch parts so progress remains adjacent to the worklist.
+* **UX**: Added whole-batch model/prompt and voice defaults, with explicit Apply to all chunks behavior; new runs and manifests use the defaults while loaded manifests retain per-chunk overrides until applied.
+* **Fix**: Batch voice-prompt fields are editable independently of the currently active Studio model capability, so prompts can be configured for a separately selected batch model and persisted into the manifest.
