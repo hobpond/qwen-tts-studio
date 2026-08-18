@@ -13,16 +13,17 @@ tags:
 
 This concept family describes the repository’s development and release operations. Start with [native CPU and CUDA builds](native-builds.md), then use [Gradle and the JVM toolchain](gradle-jvm-toolchain.md) for Kotlin/Desktop tasks. Distribution work is covered by [packaging](packaging.md), while [scripts and entry points](scripts.md) maps the helpers that compose those steps.
 
-For verification, see [tests and smoke checks](tests-and-verification.md). The release-only automation is documented in [the GitHub workflow](github-release-workflow.md). When a command fails, use [common troubleshooting](troubleshooting.md) and retain the native/runtime context described there.
+For verification, see [tests and smoke checks](tests-and-verification.md) and the [headless batch verification loop](agent-smoke-testing.md). The release-only automation is documented in [the GitHub workflow](github-release-workflow.md). When a command fails, use [common troubleshooting](troubleshooting.md) and retain the native/runtime context described there.
 
 ## Observed facts
 
 - `docs/BUILD.md` presents native compilation as a prerequisite for running or packaging the desktop application.
 - The root Gradle build exposes Windows-oriented `nativeBuild`, `nativeBuildCuda`, `packageWindows`, and `packageWindowsCuda` tasks through PowerShell scripts.
 - The only checked-in workflow is a Windows release workflow; it packages CUDA variants and publishes a GitHub release.
-- The checked-in Kotlin tests are common-source embedding arithmetic and visualization tests. Native JNI behavior is not represented by those tests.
+- The checked-in Kotlin tests include common-source embedding arithmetic and visualization tests plus desktop batch/state tests. Native JNI behavior is not represented by fake-mode tests.
+- The application entry point accepts `--headless-batch-verify`, allowing a headless fake or native generation run to produce a JSON completion report without opening a Compose window. `--agent-smoke` remains a compatibility alias.
 
-Sources: [docs/BUILD.md](../../BUILD.md), [root build.gradle.kts](../../../build.gradle.kts), [tests and smoke checks](tests-and-verification.md), and [the release workflow](../../../.github/workflows/windows-release.yml).
+Sources: [docs/BUILD.md](../../BUILD.md), [root build.gradle.kts](../../../build.gradle.kts), [tests and smoke checks](tests-and-verification.md), [headless batch verification](agent-smoke-testing.md), and [the release workflow](../../../.github/workflows/windows-release.yml).
 
 ## Inference
 

@@ -11,6 +11,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -18,6 +19,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.qwen.tts.studio.screens.SetupScreen
 import com.qwen.tts.studio.screens.BatchScreen
+import com.qwen.tts.studio.screens.BatchScreenFileActions
+import com.qwen.tts.studio.screens.BatchUiTestTags
 import com.qwen.tts.studio.screens.StudioScreen
 import com.qwen.tts.studio.screens.VoiceLabScreen
 import com.qwen.tts.studio.screens.VoicesScreen
@@ -45,6 +48,13 @@ enum class Screen(val label: String, val icon: ImageVector) {
     Setup("Setup", Icons.Default.Settings)
 }
 
+/** View-model bundle used by production and by the in-process headed UI harness. */
+data class AppViewModels(
+    val settings: SettingsViewModel,
+    val studio: StudioViewModel,
+    val voices: VoicesViewModel
+)
+
 /**
  * The root composable function for the Qwen-TTS Studio application.
  * It sets up the main layout, navigation rail, and theme management.
@@ -56,14 +66,20 @@ enum class Screen(val label: String, val icon: ImageVector) {
 @Preview
 fun App(
     isDarkMode: Boolean = true,
-    onThemeToggle: () -> Unit = {}
+    onThemeToggle: () -> Unit = {},
+    initialScreen: Screen = Screen.Studio,
+    harnessViewModels: AppViewModels? = null,
+    batchFileActions: BatchScreenFileActions? = null
 ) {
-    var currentScreen by remember { mutableStateOf(Screen.Studio) }
+    var currentScreen by remember { mutableStateOf(initialScreen) }
     
     // Shared ViewModels
-    val settingsViewModel: SettingsViewModel = viewModel { SettingsViewModel() }
-    val studioViewModel: StudioViewModel = viewModel { StudioViewModel() }
-    val voicesViewModel: VoicesViewModel = viewModel { VoicesViewModel(settingsViewModel.appDir.value) }
+    val settingsViewModel = harnessViewModels?.settings
+        ?: viewModel { SettingsViewModel() }
+    val studioViewModel = harnessViewModels?.studio
+        ?: viewModel { StudioViewModel() }
+    val voicesViewModel = harnessViewModels?.voices
+        ?: viewModel { VoicesViewModel(settingsViewModel.appDir.value) }
     val voiceLabSessionState = rememberVoiceLabSessionState()
     val appDir by settingsViewModel.appDir.collectAsState()
     val showWelcome by settingsViewModel.showWelcome.collectAsState()
@@ -108,6 +124,7 @@ fun App(
                             NavigationRailItem(
                                 selected = selected,
                                 onClick = { currentScreen = screen },
+                                modifier = if (screen == Screen.Batch) Modifier.testTag(BatchUiTestTags.navigationBatch) else Modifier,
                                 icon = { Icon(screen.icon, contentDescription = screen.label) },
                                 label = {
                                     Text(
@@ -145,7 +162,7 @@ fun App(
                     Box(modifier = Modifier.fillMaxSize()) {
                         when (currentScreen) {
                             Screen.Studio -> StudioScreen(studioViewModel, settingsViewModel, voicesViewModel)
-                            Screen.Batch -> BatchScreen(studioViewModel, settingsViewModel, voicesViewModel)
+                            Screen.Batch -> BatchScreen(studioViewModel, settingsViewModel, voicesViewModel, batchFileActions)
                             Screen.Voices -> VoicesScreen(voicesViewModel, settingsViewModel)
                             Screen.VoiceLab -> VoiceLabScreen(
                                 viewModel = voicesViewModel,

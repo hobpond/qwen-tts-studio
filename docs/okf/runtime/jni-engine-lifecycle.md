@@ -14,6 +14,7 @@ tags: [runtime, jni, lifecycle, resources]
 - [`loadIclPromptEncoderDetailed`](../../../composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/engine/QwenEngine.kt#L514-L585) follows the same ownership sequence but calls a distinct native loader. A missing ICL JNI symbol is treated as a fallback-eligible failure.
 - [`release`](../../../composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/engine/QwenEngine.kt#L724-L737) calls `nativeFree` only for a non-zero pointer and then sets the pointer to zero. `StudioViewModel` and `VoicesViewModel` call release on backend changes and during `onCleared`; the Studio native executor is also closed during ViewModel teardown ([Studio cleanup](../../../composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/viewmodel/StudioViewModel.kt#L941-L952), [Voices cleanup](../../../composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/viewmodel/VoicesViewModel.kt#L1841-L1856)).
 - Studio native operations run on one daemon executor, and voice-preset operations run on another single-thread executor. This is an observed Kotlin-side serialization policy, not proof that the native engine itself is thread-safe.
+- Batch streaming synthesis passes the same per-chunk `maxAudioTokens` budget as buffered synthesis through `NativeParams`; callers must subtract formatted text/instruction context from the native 4,096-token talker context and account for CustomVoice's slower, longer audio.
 
 ## Inference / limits
 
@@ -26,4 +27,3 @@ tags: [runtime, jni, lifecycle, resources]
 - [Model loading](model-loading.md)
 - [CLI fallback](cli-fallback.md)
 - [Runtime failure modes](runtime-failure-modes.md)
-

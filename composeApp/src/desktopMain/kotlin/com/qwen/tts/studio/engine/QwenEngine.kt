@@ -1,6 +1,8 @@
 package com.qwen.tts.studio.engine
 
 import java.io.File
+import java.io.FileInputStream
+import java.security.MessageDigest
 import javax.sound.sampled.AudioFormat
 import javax.sound.sampled.AudioSystem
 
@@ -50,6 +52,24 @@ class QwenEngine {
     )
 
     data class BackendMemory(val freeBytes: Long, val totalBytes: Long)
+
+    /** Fingerprinted native artifact captured for durable batch provenance. */
+    data class NativeRuntimeArtifact(
+        val role: String,
+        val fileName: String,
+        val absolutePath: String,
+        val sizeBytes: Long,
+        val sha256: String
+    )
+
+    /** The loaded JNI distribution and the backend libraries it actually loaded. */
+    data class NativeRuntimeIdentity(
+        val rootPath: String,
+        val nativeLibrary: NativeRuntimeArtifact,
+        val dependencies: List<NativeRuntimeArtifact>,
+        val activeBackendName: String?,
+        val compiledBackendMask: Int
+    )
 
     /**
      * Parameters for the synthesis operation.
@@ -114,6 +134,10 @@ class QwenEngine {
     fun supportsReusableBufferedSession(): Boolean =
         executionMode() == QwenEngineExecutionMode.Native
 
+    /** Exact native BPE count for the TTS-formatted prompt, or -1 when unavailable. */
+    fun textTokenCount(text: String): Int =
+        if (nativePtr == 0L) -1 else nativeTextTokenCount(nativePtr, text)
+
     /** Returns active backend memory when the native build exposes it. */
     fun backendMemory(): BackendMemory? {
         if (nativePtr == 0L) return null
@@ -175,6 +199,8 @@ class QwenEngine {
 
         private var isNativeLoaded = false
         private var nativeLoadError: String? = null
+        private var nativeRoot: File? = null
+        private var loadedNativeArtifactFiles: List<Pair<String, File>> = emptyList()
         private val loadLock = Any()
 
         /**
@@ -224,6 +250,18 @@ class QwenEngine {
         private fun resolveNativeRoot(): File {
             val userDir = File(System.getProperty("user.dir"))
             val candidates = mutableListOf<File>()
+
+            // An explicit JNI path is an intentional runtime override. Put it
+            // before the repository root so a rebuilt/staged DLL cannot be
+            // shadowed by a stale qwen3_tts.dll left in the checkout.
+            val jnaLibPath = System.getProperty("jna.library.path")
+            if (!jnaLibPath.isNullOrBlank()) {
+                jnaLibPath.split(File.pathSeparator)
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .mapTo(candidates) { File(it) }
+            }
+
             candidates += userDir
             userDir.parentFile?.let { candidates += it }
             
@@ -233,14 +271,6 @@ class QwenEngine {
             userDir.parentFile?.let { 
                 candidates += File(it, "external/qwen3-tts-cpp/build") 
                 candidates += File(it, "external/build-linux")
-            }
-
-            val jnaLibPath = System.getProperty("jna.library.path")
-            if (!jnaLibPath.isNullOrBlank()) {
-                jnaLibPath.split(File.pathSeparator)
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-                    .mapTo(candidates) { File(it) }
             }
 
             val isWindows = System.getProperty("os.name").lowercase().contains("win")
@@ -260,6 +290,12 @@ class QwenEngine {
                 try {
                     val root = resolveNativeRoot()
                     println("[QwenEngine] Root found at: ${root.absolutePath}")
+                    val loadedArtifacts = mutableListOf<Pair<String, File>>()
+
+                    fun loadArtifact(role: String, file: File) {
+                        System.load(file.absolutePath)
+                        loadedArtifacts += role to file
+                    }
 
                     val isWindows = System.getProperty("os.name").lowercase().contains("win")
                     val ext = if (isWindows) ".dll" else ".so"
@@ -289,11 +325,11 @@ class QwenEngine {
                     if (!ggmlBase.exists()) {
                         throw IllegalStateException("Missing required dependency: $ggmlBaseName. Checked ${root.absolutePath} and its ggml/src subdirectory.")
                     }
-                    System.load(ggmlBase.absolutePath)
+                    loadArtifact("ggml-base", ggmlBase)
                     println("[QwenEngine] Loaded dependency from root: ${ggmlBase.name}")
 
                     if (isWindows) {
-                        preloadWindowsCudaRuntime(root)
+                        preloadWindowsCudaRuntime(root).forEach { loadedArtifacts += "cuda-runtime" to it }
                     }
 
                     // Optional backend dependencies (CPU / CUDA).
@@ -308,7 +344,7 @@ class QwenEngine {
                         
                         if (!depFile.exists()) continue
                         try {
-                            System.load(depFile.absolutePath)
+                            loadArtifact("ggml-backend", depFile)
                             println("[QwenEngine] Loaded dependency from root: $depName")
                             backendLoaded = true
                         } catch (e: Throwable) {
@@ -334,16 +370,20 @@ class QwenEngine {
                     if (!ggml.exists()) {
                         throw IllegalStateException("Missing required dependency: $ggmlName. Checked ${root.absolutePath} and its ggml/src subdirectory.")
                     }
-                    System.load(ggml.absolutePath)
+                    loadArtifact("ggml", ggml)
                     println("[QwenEngine] Loaded dependency from root: ${ggml.name}")
 
                     val mainLibName = if (isWindows) "qwen3_tts.dll" else "libqwen3_tts.so"
                     val dll = File(root, mainLibName)
-                    System.load(dll.absolutePath)
+                    loadArtifact("native-library", dll)
                     isNativeLoaded = true
+                    nativeRoot = root.absoluteFile.normalize()
+                    loadedNativeArtifactFiles = loadedArtifacts.toList()
                     nativeLoadError = null
                     println("[QwenEngine] JNI loaded successfully: ${dll.absolutePath}")
                 } catch (e: Throwable) {
+                    nativeRoot = null
+                    loadedNativeArtifactFiles = emptyList()
                     nativeLoadError = e.message?.takeIf { it.isNotBlank() }
                         ?: e::class.simpleName
                         ?: "Unknown native library error"
@@ -353,7 +393,8 @@ class QwenEngine {
             }
         }
 
-        private fun preloadWindowsCudaRuntime(root: File) {
+        private fun preloadWindowsCudaRuntime(root: File): List<File> {
+            val loaded = mutableListOf<File>()
             val cudaRuntimePatterns = listOf(
                 "cudart64_*.dll",
                 "cublas64_*.dll",
@@ -392,12 +433,14 @@ class QwenEngine {
                 if (runtimeDll != null) {
                     try {
                         System.load(runtimeDll.absolutePath)
+                        loaded += runtimeDll
                         println("[QwenEngine] Loaded CUDA runtime: ${runtimeDll.absolutePath}")
                     } catch (e: Throwable) {
                         System.err.println("[QwenEngine] Failed to preload CUDA runtime ${runtimeDll.name}: ${e.message}")
                     }
                 }
             }
+            return loaded
         }
 
         private fun wildcardMatches(pattern: String, value: String): Boolean {
@@ -426,6 +469,7 @@ class QwenEngine {
     private external fun nativeInit(): Long
     private external fun nativeFree(ptr: Long)
     private external fun nativeLoadModels(ptr: Long, modelDir: String, modelName: String?): Boolean
+    private external fun nativeTextTokenCount(ptr: Long, text: String): Int
     private external fun nativeLoadIclPromptEncoder(ptr: Long, modelDir: String, modelName: String?): Boolean
     private external fun nativeSetBackendPreference(preference: Int): Boolean
     private external fun nativeGetCompiledBackendMask(): Int
@@ -466,6 +510,43 @@ class QwenEngine {
     private external fun nativeGetAvailableSpeakers(ptr: Long): String?
     private external fun nativeGetLastError(ptr: Long): String?
     private external fun nativeGetModelCapabilities(ptr: Long): NativeCapabilities?
+
+    /** Returns fingerprints for the loaded JNI distribution, or null in CLI/unloaded mode. */
+    fun runtimeIdentity(): NativeRuntimeIdentity? {
+        val snapshot = synchronized(loadLock) {
+            if (!isNativeLoaded || nativeRoot == null || loadedNativeArtifactFiles.isEmpty()) null
+            else nativeRoot!! to loadedNativeArtifactFiles.toList()
+        } ?: return null
+        val artifacts = snapshot.second.mapNotNull { (role, file) -> fingerprintNativeArtifact(role, file) }
+        val nativeLibrary = artifacts.firstOrNull { it.role == "native-library" } ?: return null
+        return NativeRuntimeIdentity(
+            rootPath = snapshot.first.absolutePath,
+            nativeLibrary = nativeLibrary,
+            dependencies = artifacts.filterNot { it.role == "native-library" },
+            activeBackendName = runCatching { nativeGetActiveBackendName() }.getOrNull(),
+            compiledBackendMask = runCatching { nativeGetCompiledBackendMask() }.getOrDefault(BACKEND_CPU)
+        )
+    }
+
+    private fun fingerprintNativeArtifact(role: String, file: File): NativeRuntimeArtifact? {
+        if (!file.isFile) return null
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > 0) digest.update(buffer, 0, count)
+            }
+        }
+        return NativeRuntimeArtifact(
+            role = role,
+            fileName = file.name,
+            absolutePath = file.absoluteFile.normalize().path,
+            sizeBytes = file.length(),
+            sha256 = digest.digest().joinToString("") { "%02x".format(it) }
+        )
+    }
 
     /**
      * Loads the engine and models from the specified directory.
@@ -718,6 +799,7 @@ class QwenEngine {
         languageId: Int = 2050,
         instruction: String? = null,
         speaker: String? = null,
+        maxAudioTokens: Int = NativeParams().maxAudioTokens,
         options: StreamingOptions = StreamingOptions(),
         onAudioChunk: (NativeAudioChunk) -> Boolean
     ): NativeResult? {
@@ -733,7 +815,12 @@ class QwenEngine {
         if (nativePtr == 0L) return null
 
         return try {
-            val params = NativeParams(languageId = languageId, instruction = instruction, speaker = speaker)
+            val params = NativeParams(
+                languageId = languageId,
+                instruction = instruction,
+                speaker = speaker,
+                maxAudioTokens = maxAudioTokens.coerceAtLeast(1)
+            )
             val callback = object : StreamingAudioCallback {
                 override fun onAudioChunk(
                     audio: FloatArray,

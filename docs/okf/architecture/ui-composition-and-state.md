@@ -19,6 +19,9 @@ sources:
   - /composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/viewmodel/SettingsViewModel.kt
   - /composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/viewmodel/StudioViewModel.kt
   - /composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/viewmodel/VoicesViewModel.kt
+  - /composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/agent/AgentSmokeRunner.kt
+  - /composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/screens/BatchUiInstrumentation.kt
+  - /composeApp/src/desktopTest/kotlin/com/qwen/tts/studio/screens/HeadedBatchUiInstrumentationTest.kt
 ---
 
 # Compose screens and view-model state
@@ -56,6 +59,14 @@ The screens generally use `collectAsState()` and `LaunchedEffect` to translate s
 - `VoicesViewModel` owns `VoicePreset` state, recording, extraction of speaker embeddings and ICL prompts, model-session reuse, Voice Lab arithmetic orchestration, temporary preview synthesis/playback, mixed-preset creation, and TSV/file artifacts. It also has a dedicated native executor and cleans up it and preview/recording resources on clear.
 
 The view models are feature owners, not passive stores. For example, `StudioViewModel.generateAudio` loads the model, reads capabilities, selects the effective named-speaker/instruction/embedding/ICL inputs, invokes synthesis, and updates playback state. `VoicesViewModel.createVoicePreset` can load several compatible talker models and create dimension-specific artifacts before persisting one preset.
+
+## Headless batch verification seam
+
+`StudioViewModel` keeps the production `QwenBatchEngine` as its default reusable-batch implementation, but accepts a batch-engine factory. The [headless batch verification runner](../operations/agent-smoke-testing.md) supplies a deterministic engine in fake mode or the real JNI wrapper in native mode, then observes the same batch state flow and invokes the same validation/recombination actions as the UI. This keeps verification evidence at the view-model/application boundary without duplicating inference logic or requiring Compose window automation.
+
+## Headed semantic validation seam
+
+`App` accepts an optional `AppViewModels` bundle and `BatchScreen` accepts optional `BatchScreenFileActions` only for in-process UI validation. Production calls retain the normal lifecycle-owned view models and FileKit pickers. The headed test supplies deterministic view models and immediate file/save callbacks, then mounts the real `App` and drives its rendered semantics tree with Compose UI test actions. `BatchUiTestTags` and operation `stateDescription` values are stable machine-facing targets for navigation, file selection, generation, validation, and recombination; they are not pixel coordinates or OS accessibility automation. This gives the agent a second evidence layer: the headless action contract proves orchestration and persistence, while the headed test proves that the visible controls are present, enabled at the right time, and reflect the same terminal state.
 
 ## Async and lifecycle rules observed in code
 

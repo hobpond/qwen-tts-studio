@@ -45,4 +45,3 @@ These invariants connect [Setup](setup.md), [Studio](studio.md), [Voices](voices
 - [Speaker embeddings](embeddings.md)
 - [ICL prompts](icl-prompts.md)
 - [Voice Lab workflow](voice-lab.md)
-

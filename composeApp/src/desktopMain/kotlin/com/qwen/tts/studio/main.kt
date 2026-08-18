@@ -7,44 +7,60 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import com.qwen.tts.studio.agent.HeadlessBatchVerificationRunner
+import com.qwen.tts.studio.agent.AgentAsrInspectionRunner
+import com.qwen.tts.studio.agent.AsrConcurrencyRunner
 import java.awt.Color
 import java.awt.Dimension
 import java.awt.Window as AwtWindow
 import javax.swing.SwingUtilities
 import kotlin.math.roundToInt
+import kotlin.system.exitProcess
 
 /**
  * The main entry point for the desktop application.
  * Bootstraps the Compose window, sets up the window state, and applies platform-specific styling.
  */
-fun main() = application {
-    var isDarkMode by remember { mutableStateOf(true) }
-    val windowState = rememberWindowState(width = 1440.dp, height = 1000.dp)
+fun main(args: Array<String>) {
+    if (args.contains("--agent-asr-inspect")) {
+        exitProcess(AgentAsrInspectionRunner.run(args))
+    }
+    if (args.contains("--agent-asr-concurrency")) {
+        exitProcess(AsrConcurrencyRunner.run(args))
+    }
+    if (args.contains("--headless-batch-verify") || args.contains("--agent-smoke")) {
+        exitProcess(HeadlessBatchVerificationRunner.run(args))
+    }
 
-    Window(
-        onCloseRequest = ::exitApplication,
-        title = "Qwen-TTS Studio",
-        icon = painterResource("icons/app-icon.svg"),
-        state = windowState,
-    ) {
-        val density = LocalDensity.current
-        LaunchedEffect(density) {
-            // Keep the full Studio action area usable at startup and during resize.
-            // Convert from dp so the minimum remains consistent on scaled Windows displays.
-            window.minimumSize = with(density) {
-                Dimension(1200.dp.toPx().roundToInt(), 900.dp.toPx().roundToInt())
+    application {
+        var isDarkMode by remember { mutableStateOf(true) }
+        val windowState = rememberWindowState(width = 1440.dp, height = 1000.dp)
+
+        Window(
+            onCloseRequest = ::exitApplication,
+            title = "Qwen-TTS Studio",
+            icon = painterResource("icons/app-icon.svg"),
+            state = windowState,
+        ) {
+            val density = LocalDensity.current
+            LaunchedEffect(density) {
+                // Keep the full Studio action area usable at startup and during resize.
+                // Convert from dp so the minimum remains consistent on scaled Windows displays.
+                window.minimumSize = with(density) {
+                    Dimension(1200.dp.toPx().roundToInt(), 900.dp.toPx().roundToInt())
+                }
             }
-        }
 
-        // Apply dark title bar if possible (Windows 10/11)
-        val window = window
-        LaunchedEffect(isDarkMode) {
-            SwingUtilities.invokeLater {
-                applyDarkTitleBar(window, isDarkMode)
+            // Apply dark title bar if possible (Windows 10/11)
+            val window = window
+            LaunchedEffect(isDarkMode) {
+                SwingUtilities.invokeLater {
+                    applyDarkTitleBar(window, isDarkMode)
+                }
             }
-        }
 
-        App(isDarkMode = isDarkMode, onThemeToggle = { isDarkMode = !isDarkMode })
+            App(isDarkMode = isDarkMode, onThemeToggle = { isDarkMode = !isDarkMode })
+        }
     }
 }
 
