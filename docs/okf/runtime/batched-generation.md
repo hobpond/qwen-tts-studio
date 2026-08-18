@@ -20,6 +20,9 @@ sources:
   - https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
   - https://github.com/QwenLM/Qwen3-TTS/blob/main/qwen_tts/inference/qwen3_tts_model.py
   - https://arxiv.org/abs/2601.15621
+  - /scripts/render-audiobook-video.py
+  - D:/work/ktv-pitcch/pipeline/src/ktv_pipeline/lyric_video.py
+  - D:/work/ktv-pitcch/knowledge/research/decisions/app/d17-ktv-two-line-wipe-presentation.md
 ---
 
 # Reusable batched generation
@@ -95,6 +98,24 @@ Model and native-runtime fingerprints participate in resume compatibility. A cha
 - Recombination streams chunk PCM and keeps the aggregate byte count in a 64-bit value. Standard RIFF/WAV size fields are unsigned 32-bit, so payloads above Java's signed `Int` limit but below the 4 GiB RIFF ceiling remain valid; larger outputs fail closed with an explicit format-limit error.
 - Stop scheduling new chunks on cancellation; preserve completed files; write chunks and manifest updates through temporary files plus atomic rename. Retry policy must make sampling nondeterminism explicit.
 - Do not treat streaming callbacks as recombinable batch chunks until `startSample`/`endSample`, overlap policy, channels, and PCM format are established by native evidence.
+
+## Audiobook sweep video export
+
+The manifest-driven backend exporter at `/scripts/render-audiobook-video.py` adapts the local KTV renderer for audiobook learning. It uses the validated manifest as the control plane, sums each chunk's `frameCount / sampleRate` interval, and muxes the existing `combined.wav`; it never regenerates TTS or reads a second source-text copy. `scripts/render-audiobook-video.ps1` is the Windows entrypoint.
+
+The video uses a dark background and a centered multi-line reading window. The default is seven fixed rows (`--lines-on-screen 7`): three preceding lines are sung white context, the active line remains centered with ASS `\\kf` smooth-fill tags, and three following lines are blue read-ahead. The odd row count can be set from 3 through 11; the wrapper defaults to a 36px font at 1280x720 so more audiobook text stays visible without making the characters too small. Source whitespace is normalized only for presentation (BOM removed, Unicode whitespace collapsed to one space); the manifest's source text remains unchanged.
+
+The exporter labels its timing source `uniform-character-within-chunk`: the current manifest has chunk-level audio frames but no measured character alignments, so the sweep is an explicit visualization estimate rather than a phoneme-timing claim. It writes the `.ass` sidecar and a JSON report containing manifest identity, model/voice provenance references, text fingerprints, layout settings, stream probes, and pixel counts. A render is not accepted until ffprobe sees exactly one H.264 video stream and one AAC audio stream and a raw-frame probe observes a non-decreasing net rise in sung pixels across the longest active-line sweep. A bounded `--duration-limit` proof and an unbounded full export use the same plan and checks; a real 90-second seven-row proof passed at 1280x720 before the full export was started.
+
+Long exports use parallel video-only segments by default (`--segment-duration 600`, `--segment-workers 2`). Boundaries are moved to display-line starts so each segment has a complete local active-line sweep; the segment ASS files are rendered concurrently, joined with the ffmpeg concat demuxer using `-c copy`, and the original combined WAV is encoded to AAC exactly once during the final mux. This avoids repeating a large audio encode per segment and keeps the WAV/manifest timing authoritative. `--segment-duration 0` retains the monolithic fallback, while `--keep-segments` preserves intermediate segment ASS/video files for diagnosis or later re-joining. The JSON report records the segment count, worker count, boundaries, join method, and single-mux policy.
+
+The resumable delivery mode is enabled with `--streamable` (also available as `-Streamable` through the PowerShell wrapper). It first creates or reuses `<output>.audio.m4a` plus a sidecar containing the source WAV size/mtime, audio format, bitrate, and target duration. The final MP4 uses `empty_moov`/fragmented-MP4 flags and copies the cached AAC and joined H.264 streams, so retrying assembly does not re-encode the multi-hour WAV. It also writes `<output-stem>-hls/<output-stem>.m3u8` with fMP4 segments and a transactional `init.mp4`; the report records both delivery artifacts and verifies their references. Streamable runs retain line-aligned video segments and a parameter/source fingerprint in `segments.json`, allowing a compatible rerun to reuse completed video segments. This is a resumable streamable delivery package after the manifest-backed artifacts exist; it is not yet live TTS-to-player transport.
+
+## Application orchestration contract
+
+The platform-neutral contract at `/composeApp/src/commonMain/kotlin/com/qwen/tts/studio/orchestration/AudiobookPipelineContract.kt` is the shared command/event/snapshot seam for headed UI, headless instrumentation, and future streaming workers. It carries run and command IDs, manifest revisions, leases, provenance, artifact handles, chunk lifecycle, validation state, generated/playable/validated/visual-ready distinctions, and explicit start/resume/cancel/retry/rechunk/validate/combine/render/stream commands. `PipelineSnapshot.apply` and `PipelineCommandGuards` provide common stale-event and stale-command behavior so clients reconcile one durable control plane.
+
+The desktop core at `/composeApp/src/desktopMain/kotlin/com/qwen/tts/studio/orchestration/DesktopAudiobookPipelineOrchestrator.kt` serializes ordinary commands, gives cancellation a separate control path, reduces executor events into a `StateFlow`, and exposes command evidence without owning Qwen engines or mutating manifests. The UI-facing `BatchPipelineBinding` forwards the same snapshot/event stream to Compose or instrumentation scopes. Concrete executors remain responsible for calling the existing `StudioViewModel`/`BatchAudioStore` workflow, preserving native lifetime, manifest locks, and validation leases.
 
 ## Remaining native verification limits
 
