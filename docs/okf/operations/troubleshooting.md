@@ -25,6 +25,7 @@ Use the symptom to choose the first boundary to inspect: [JVM/Gradle](gradle-jvm
 | Linux DEB missing native libraries | Prefer the standalone Linux app path while investigating. The Linux packaging script itself notes that side-loaded native libraries are not automatically included in DEB/RPM output. |
 | Tests pass but app fails | Treat the result as a pure Kotlin-test result only. Run the native build and desktop smoke test because current tests do not load JNI or model/runtime dependencies. |
 | Packaged app fails to load native code | Inspect the app image after the Compose step and confirm the package script copied the expected DLLs/SOs into the runtime directory. On Windows, use the generated `qwen-tts-studio-debug.ps1` launcher to capture an app log. |
+| Queued batch reports a manifest conflict | Another writer changed the durable batch while TTS, ASR, or rechunking was in flight. Keep the current manifest and artifacts, reload the Batch workspace, and resume from the durable plan; do not force a stale validation or whole-manifest snapshot back into `manifest.json`. |
 
 ## Inference
 

@@ -7,20 +7,29 @@ import javax.sound.sampled.AudioInputStream
 import javax.sound.sampled.AudioSystem
 
 internal interface QwenAsrNativeApi {
-    fun init(): Long
+    fun init(backendPreference: NativeBackendPreference): Long
     fun free(ptr: Long)
     fun loadModel(ptr: Long, modelPath: String): Boolean
+    fun backendName(ptr: Long): String?
+    fun backendEvidence(ptr: Long): LongArray?
     fun transcribe(ptr: Long, samples: FloatArray, maxTokens: Int, threads: Int): QwenAsrEngine.NativeResult?
 }
 
 /** In-process Qwen3-ASR facade backed by the same native DLL and GGML build as TTS. */
 class QwenAsrEngine private constructor(
+    private val backendPreference: NativeBackendPreference,
     private val nativeApi: QwenAsrNativeApi?,
     private val ensureNativeLibrary: Boolean
 ) : AutoCloseable {
-    constructor() : this(null, true)
+    /** CPU is the safe default; pass [NativeBackendPreference.Cuda] to request CUDA explicitly. */
+    constructor() : this(NativeBackendPreference.Cpu, null, true)
 
-    internal constructor(nativeApi: QwenAsrNativeApi) : this(nativeApi, false)
+    constructor(backendPreference: NativeBackendPreference) : this(backendPreference, null, true)
+
+    internal constructor(
+        nativeApi: QwenAsrNativeApi,
+        backendPreference: NativeBackendPreference = NativeBackendPreference.Cpu
+    ) : this(backendPreference, nativeApi, false)
 
     data class NativeResult(
         val text: String,
@@ -30,11 +39,24 @@ class QwenAsrEngine private constructor(
         val timeMs: Long
     )
 
+    data class BackendInfo(
+        val requestedPreference: NativeBackendPreference,
+        val name: String,
+        val gpuActive: Boolean,
+        val encoderWeightsOnGpu: Boolean,
+        val decoderWeightsOnGpu: Boolean,
+        val freeBytes: Long?,
+        val totalBytes: Long?
+    ) {
+        val weightsOnGpu: Boolean
+            get() = encoderWeightsOnGpu && decoderWeightsOnGpu
+    }
+
     private var nativePtr: Long = 0L
 
     init {
         if (ensureNativeLibrary) QwenEngine.ensureNativeLibrary()
-        nativePtr = nativeApi?.init() ?: nativeInit()
+        nativePtr = nativeApi?.init(effectiveBackendPreference) ?: nativeInitWithBackend(effectiveBackendPreference.nativeValue())
         check(nativePtr != 0L) { "Could not initialize the native Qwen3-ASR engine." }
     }
 
@@ -46,6 +68,14 @@ class QwenAsrEngine private constructor(
             check(loaded) {
                 val nativeError = if (nativeApi == null) nativeGetLastError(nativePtr) else null
                 "Could not load Qwen3-ASR model: ${nativeError ?: modelFile.absolutePath}"
+            }
+            backendInfo()?.let { info ->
+                println(
+                    "[QwenAsrEngine] backend=${info.name} gpuActive=${info.gpuActive} " +
+                        "encoderWeightsOnGpu=${info.encoderWeightsOnGpu} " +
+                        "decoderWeightsOnGpu=${info.decoderWeightsOnGpu} " +
+                        "freeBytes=${info.freeBytes ?: -1} totalBytes=${info.totalBytes ?: -1}"
+                )
             }
         } catch (error: Throwable) {
             runCatching { close() }.onFailure(error::addSuppressed)
@@ -68,6 +98,26 @@ class QwenAsrEngine private constructor(
         return result
     }
 
+    /** Returns native backend/device and weight-placement evidence for this loaded ASR instance. */
+    fun backendInfo(): BackendInfo? {
+        if (nativePtr == 0L) return null
+        val evidence = nativeApi?.backendEvidence(nativePtr) ?: nativeGetBackendEvidence(nativePtr)
+        if (evidence == null || evidence.size < BACKEND_EVIDENCE_SIZE) return null
+        val name = (nativeApi?.backendName(nativePtr) ?: nativeGetBackendName(nativePtr))
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: "unknown"
+        return BackendInfo(
+            requestedPreference = effectiveBackendPreference,
+            name = name,
+            gpuActive = evidence[0] != 0L,
+            encoderWeightsOnGpu = evidence[1] != 0L,
+            decoderWeightsOnGpu = evidence[2] != 0L,
+            freeBytes = evidence[3].takeIf { it >= 0L },
+            totalBytes = evidence[4].takeIf { it >= 0L }
+        )
+    }
+
     override fun close() {
         if (nativePtr != 0L) {
             nativeApi?.free(nativePtr) ?: nativeFree(nativePtr)
@@ -75,11 +125,26 @@ class QwenAsrEngine private constructor(
         }
     }
 
-    private external fun nativeInit(): Long
+    private external fun nativeInitWithBackend(backendPreference: Int): Long
     private external fun nativeFree(ptr: Long)
     private external fun nativeLoadModel(ptr: Long, modelPath: String): Boolean
     private external fun nativeGetLastError(ptr: Long): String?
+    private external fun nativeGetBackendName(ptr: Long): String?
+    private external fun nativeGetBackendEvidence(ptr: Long): LongArray?
     private external fun nativeTranscribeSamples(ptr: Long, samples: FloatArray, maxTokens: Int, threads: Int): NativeResult?
+
+    private val effectiveBackendPreference: NativeBackendPreference
+        get() = if (backendPreference == NativeBackendPreference.Cuda) {
+            NativeBackendPreference.Cuda
+        } else {
+            // Auto remains CPU for ASR.  GPU use must be an explicit request.
+            NativeBackendPreference.Cpu
+        }
+
+    private fun NativeBackendPreference.nativeValue(): Int = when (this) {
+        NativeBackendPreference.Cuda -> BACKEND_CUDA
+        NativeBackendPreference.Auto, NativeBackendPreference.Cpu -> BACKEND_CPU
+    }
 
     private fun readSamples(stream: AudioInputStream, window: AsrAudioWindow?): FloatArray {
         if (window == null) return readAllSamples(stream)
@@ -177,6 +242,9 @@ class QwenAsrEngine private constructor(
 
     private companion object {
         const val TARGET_FRAME_SIZE = 2
+        const val BACKEND_EVIDENCE_SIZE = 5
+        const val BACKEND_CPU = 1
+        const val BACKEND_CUDA = 2
     }
 }
 

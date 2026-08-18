@@ -10,8 +10,12 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.CheckCircle
@@ -42,6 +46,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -61,6 +68,7 @@ import com.qwen.tts.studio.engine.QwenEngine
 import com.qwen.tts.studio.viewmodel.SettingsViewModel
 import com.qwen.tts.studio.viewmodel.StudioViewModel
 import com.qwen.tts.studio.viewmodel.BatchChunkValidationState
+import com.qwen.tts.studio.viewmodel.BatchIncrementalValidationSettings
 import com.qwen.tts.studio.viewmodel.VoiceCloneMode
 import com.qwen.tts.studio.viewmodel.VoicesViewModel
 import io.github.vinceglb.filekit.core.PickerType
@@ -78,7 +86,8 @@ import kotlinx.coroutines.delay
 fun BatchScreen(
     viewModel: StudioViewModel,
     settingsViewModel: SettingsViewModel,
-    voicesViewModel: VoicesViewModel
+    voicesViewModel: VoicesViewModel,
+    fileActions: BatchScreenFileActions? = null
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val modelDir by settingsViewModel.modelDir.collectAsState()
@@ -124,6 +133,10 @@ fun BatchScreen(
     val batchVoiceName = batchState.batchVoiceName ?: uiState.selectedVoice
     val batchModelName = batchState.batchModelName ?: modelName
     val batchVoicePrompt = batchState.batchVoicePrompt ?: uiState.selectedInstruction
+    var chunkSearch by remember(batchManifestPath, batchManifest?.batchId) { mutableStateOf("") }
+    var chunkFilter by remember(batchManifestPath, batchManifest?.batchId) { mutableStateOf(BatchChunkFilter.All) }
+    var chunkFilterMenuOpen by remember(batchManifestPath, batchManifest?.batchId) { mutableStateOf(false) }
+    val chunkListState = rememberLazyListState()
 
     LaunchedEffect(validationJob) {
         val job = validationJob ?: return@LaunchedEffect
@@ -155,7 +168,7 @@ fun BatchScreen(
             runCatching {
                 val plan = viewModel.batchMemoryPlan()
                 val limit = plan.maxCharacters ?: error(plan.reason ?: "Insufficient observed memory for batch planning.")
-                TextBatching.packParagraphs(Files.readString(File(path).toPath(), StandardCharsets.UTF_8), limit)
+                TextBatching.packParagraphsForGeneration(Files.readString(File(path).toPath(), StandardCharsets.UTF_8), limit)
             }
                 .onSuccess { texts ->
                     viewModel.setBatchSource(path, texts, File(path).absoluteFile.parentFile?.path.orEmpty())
@@ -192,7 +205,19 @@ fun BatchScreen(
                 ?: viewModel.recombineBatchToFile(File(output))
         }
     }
+    val pickTextFile = fileActions?.pickTextFile ?: { batchTextPicker.launch() }
+    val loadManifest = fileActions?.loadManifest ?: { batchManifestPicker.launch() }
+    val pickOutputDirectory = fileActions?.pickOutputDirectory ?: { batchDirectoryPicker.launch() }
+    val saveCombined = fileActions?.saveCombined
+        ?: { batchRecombineSaver.launch(baseName = "batch-combined", extension = "wav") }
     val asrModelFile = File(modelDir, SettingsViewModel.ASR_MODEL_NAME)
+    val incrementalBatchValidation = asrModelFile.takeIf { it.isFile }?.let {
+        BatchIncrementalValidationSettings(
+            asrModelFile = it,
+            asrBackend = backendPreference,
+            maxRetries = 1
+        )
+    }
     fun speakersForModel(model: String?): List<String> =
         if (model == modelName) uiState.availableSpeakers else batchModelSpeakers[model].orEmpty()
     val batchVoiceOptions = (listOf(uiState.selectedVoice) + voices.map { it.name } + speakersForModel(batchModelName)).distinct()
@@ -251,7 +276,11 @@ fun BatchScreen(
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp).verticalScroll(rememberScrollState()),
+        modifier = Modifier
+            .fillMaxSize()
+            .testTag(BatchUiTestTags.surface)
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(24.dp)
     ) {
         Card(
@@ -350,9 +379,9 @@ fun BatchScreen(
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(batchTextFile, {}, readOnly = true, label = { Text("Text file or manifest") }, modifier = Modifier.weight(1f), singleLine = true)
-                    OutlinedButton(onClick = { batchTextPicker.launch() }, enabled = !workflowBusy) { Text("Browse") }
-                    OutlinedButton(onClick = { batchManifestPicker.launch() }, enabled = !workflowBusy) { Text("Load manifest") }
+                    OutlinedTextField(batchTextFile, {}, readOnly = true, label = { Text("Text file or manifest") }, modifier = Modifier.weight(1f).testTag(BatchUiTestTags.textFile), singleLine = true)
+                    OutlinedButton(onClick = pickTextFile, modifier = Modifier.testTag(BatchUiTestTags.pickText), enabled = !workflowBusy) { Text("Browse") }
+                    OutlinedButton(onClick = loadManifest, modifier = Modifier.testTag(BatchUiTestTags.loadManifest), enabled = !workflowBusy) { Text("Load manifest") }
                     OutlinedButton(
                         onClick = {
                             runCatching {
@@ -366,12 +395,13 @@ fun BatchScreen(
                                 )
                             }.onFailure { error -> viewModel.reportBatchError("Could not generate manifest: ${error.message ?: "unknown error"}") }
                         },
+                        modifier = Modifier.testTag(BatchUiTestTags.generateManifest),
                         enabled = !workflowBusy && !capturedVoiceInvalid && batchTextFile.isNotBlank() && batchTexts.isNotEmpty()
                     ) { Text("Generate manifest") }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(batchOutputDirectory, viewModel::setBatchOutputDirectory, label = { Text("Output directory") }, modifier = Modifier.weight(1f), singleLine = true)
-                    OutlinedButton(onClick = { batchDirectoryPicker.launch() }, enabled = !workflowBusy) {
+                    OutlinedTextField(batchOutputDirectory, viewModel::setBatchOutputDirectory, label = { Text("Output directory") }, modifier = Modifier.weight(1f).testTag(BatchUiTestTags.outputDirectory), singleLine = true)
+                    OutlinedButton(onClick = pickOutputDirectory, modifier = Modifier.testTag(BatchUiTestTags.pickOutputDirectory), enabled = !workflowBusy) {
                         androidx.compose.material3.Icon(Icons.Default.FolderOpen, contentDescription = null)
                         Spacer(Modifier.width(8.dp))
                         Text("Browse")
@@ -396,13 +426,13 @@ fun BatchScreen(
                 if (batchState.isRunning) {
                     LinearProgressIndicator(
                         progress = { if (batchState.total > 0) batchState.generated.toFloat() / batchState.total else 0f },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().testTag(BatchUiTestTags.progress)
                     )
                     Text(
                         if (batchState.generated > batchState.completed) {
-                            "${batchState.completed} of ${batchState.total} chunks complete · ${batchState.generated} generated"
+                            "${batchState.completed} of ${batchState.total} chunks persisted · ${batchState.validated} validated · ${batchState.generated} generated"
                         } else {
-                            "${batchState.completed} of ${batchState.total} chunks complete"
+                            "${batchState.completed} of ${batchState.total} chunks persisted · ${batchState.validated} validated"
                         },
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -421,7 +451,20 @@ fun BatchScreen(
                             batchState.isRecombining -> "Batch operation: recombining WAV..."
                             batchState.combinedFile != null -> "Batch operation complete: ${batchState.combinedFile?.name}"
                             else -> "Batch operation complete: ${batchState.completed} chunks written."
-                        }, style = MaterialTheme.typography.bodySmall
+                        },
+                        modifier = Modifier
+                            .testTag(BatchUiTestTags.operationStatus)
+                            .semantics {
+                                stateDescription = when {
+                                    batchState.isRunning -> "running"
+                                    batchState.isRecombining -> "recombining"
+                                    batchState.error != null || batchState.recombineError != null -> "failed"
+                                    batchState.combinedFile != null -> "combined"
+                                    batchState.result != null -> "complete"
+                                    else -> "idle"
+                                }
+                            },
+                        style = MaterialTheme.typography.bodySmall
                     )
                 }
                 if (batchState.isRunning) {
@@ -445,11 +488,30 @@ fun BatchScreen(
                                 validationJob = viewModel.validateAllBatchChunks(
                                     operationManifestFile,
                                     asrModelFile.takeIf { it.isFile },
-                                    batchSourceFile
+                                    batchSourceFile,
+                                    asrBackend = backendPreference
                                 )
                             },
+                            modifier = Modifier.testTag(BatchUiTestTags.validateAll),
                             enabled = !workflowBusy
                         ) { Text(if (validationActive) "Validating..." else "Validate all chunks") }
+                        val hasFailedChunks = operationManifest.chunks.any {
+                            it.status != BatchChunkStatus.COMPLETE || it.validationPassed == false
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                runCatching {
+                                    viewModel.rechunkFailedBatch(
+                                        operationManifestFile,
+                                        TextBatching.DEFAULT_RECHUNK_CHARACTERS
+                                    )
+                                }.onFailure {
+                                    viewModel.reportBatchError("Could not rechunk failed chunks: ${it.message}")
+                                }
+                            },
+                            modifier = Modifier.testTag(BatchUiTestTags.rechunkFailed),
+                            enabled = !workflowBusy && hasFailedChunks
+                        ) { Text("Rechunk failed (${TextBatching.DEFAULT_RECHUNK_CHARACTERS})") }
                         OutlinedButton(
                             onClick = {
                                 batchReplayRequest?.let { request ->
@@ -462,6 +524,7 @@ fun BatchScreen(
                                     )
                                 }
                             },
+                            modifier = Modifier.testTag(BatchUiTestTags.resume),
                             enabled = !workflowBusy && batchReplayRequest != null
                         ) { Text("Resume batch") }
                         OutlinedButton(
@@ -476,20 +539,121 @@ fun BatchScreen(
                                     )
                                 }
                             },
+                            modifier = Modifier.testTag(BatchUiTestTags.regenerateAll),
                             enabled = !workflowBusy && batchReplayRequest != null
                         ) { Text("Regenerate all chunks") }
+                        if (operationManifest.chunks.size == operationManifest.expectedChunkCount &&
+                            operationManifest.chunks.all { it.status == BatchChunkStatus.COMPLETE }
+                        ) {
+                            OutlinedButton(
+                                onClick = saveCombined,
+                                modifier = Modifier.testTag(BatchUiTestTags.combine),
+                                enabled = !workflowBusy
+                            ) { Text("Combine") }
+                        }
                     }
                 }
                 operationManifest?.let { manifest ->
+                    val allChunks = manifest.chunks.sortedBy { it.index }
+                    val normalizedChunkSearch = chunkSearch.trim()
+                    val visibleChunks = allChunks.filter { chunk ->
+                        val validation = batchState.chunkValidation[chunk.index]
+                        val isValidated = validation?.passed ?: (chunk.validationPassed == true)
+                        val matchesFilter = when (chunkFilter) {
+                            BatchChunkFilter.All -> true
+                            BatchChunkFilter.NeedsAttention ->
+                                chunk.status != BatchChunkStatus.COMPLETE || !isValidated
+                            BatchChunkFilter.Complete -> chunk.status == BatchChunkStatus.COMPLETE
+                            BatchChunkFilter.Validated ->
+                                chunk.status == BatchChunkStatus.COMPLETE && isValidated
+                        }
+                        val searchableText = buildString {
+                            append(chunk.displayIndex)
+                            append(' ')
+                            append(chunk.index)
+                            append(' ')
+                            append(chunk.status.name)
+                            append(' ')
+                            append(chunk.voiceName.orEmpty())
+                            append(' ')
+                            append(chunk.text)
+                        }
+                        matchesFilter && (normalizedChunkSearch.isBlank() || searchableText.contains(normalizedChunkSearch, ignoreCase = true))
+                    }
+                    LaunchedEffect(normalizedChunkSearch, chunkFilter, manifest.batchId, allChunks.size) {
+                        chunkListState.scrollToItem(0)
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Text("Batch parts (${manifest.expectedChunkCount})", style = MaterialTheme.typography.labelLarge)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = chunkSearch,
+                                onValueChange = { chunkSearch = it },
+                                label = { Text("Find chunk, text, or voice") },
+                                placeholder = { Text("e.g. 319 or a phrase") },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f).testTag(BatchUiTestTags.chunkSearch),
+                                enabled = !workflowBusy
+                            )
+                            Box {
+                                OutlinedButton(
+                                    onClick = { chunkFilterMenuOpen = true },
+                                    modifier = Modifier.testTag(BatchUiTestTags.chunkFilter),
+                                    enabled = !workflowBusy
+                                ) { Text("Filter: ${chunkFilter.label}") }
+                                DropdownMenu(
+                                    expanded = chunkFilterMenuOpen,
+                                    onDismissRequest = { chunkFilterMenuOpen = false }
+                                ) {
+                                    BatchChunkFilter.entries.forEach { option ->
+                                        DropdownMenuItem(
+                                            text = { Text(if (option == chunkFilter) "✓ ${option.label}" else option.label) },
+                                            modifier = Modifier.testTag(BatchUiTestTags.chunkFilterOption(option.name)),
+                                            onClick = {
+                                                chunkFilter = option
+                                                chunkFilterMenuOpen = false
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                            if (chunkSearch.isNotBlank() || chunkFilter != BatchChunkFilter.All) {
+                                OutlinedButton(
+                                    onClick = {
+                                        chunkSearch = ""
+                                        chunkFilter = BatchChunkFilter.All
+                                    },
+                                    enabled = !workflowBusy
+                                ) { Text("Clear") }
+                            }
+                        }
+                        Text(
+                            "Showing ${visibleChunks.size} of ${allChunks.size} chunks",
+                            modifier = Modifier
+                                .testTag(BatchUiTestTags.chunkListSummary)
+                                .semantics { stateDescription = "${visibleChunks.size} of ${allChunks.size} chunks shown" },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("#", Modifier.width(32.dp), style = MaterialTheme.typography.labelSmall)
                             Text("Voice / text", Modifier.weight(1f), style = MaterialTheme.typography.labelSmall)
                             Text("Actions", Modifier.width(160.dp), style = MaterialTheme.typography.labelSmall)
                             Text("Validation", Modifier.width(88.dp), style = MaterialTheme.typography.labelSmall)
                         }
-                        manifest.chunks.sortedBy { it.index }.forEach { chunk ->
+                        LazyColumn(
+                            state = chunkListState,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height((visibleChunks.size * 80).coerceIn(96, 560).dp)
+                                .testTag(BatchUiTestTags.chunkList),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            items(visibleChunks, key = { it.index }) { chunk ->
                                 val validation = batchState.chunkValidation[chunk.index]
                                 val manifestFile = batchManifestPath
                             val isSavingChunk = batchState.savingChunkIndex == chunk.index
@@ -502,12 +666,12 @@ fun BatchScreen(
                             val chunkModelName = chunk.modelName ?: batchReplayRequest?.modelName ?: modelName
                              val chunkVoicePrompt = chunk.voicePrompt.orEmpty()
                              val chunkVoiceOptions = (listOf(chunkVoiceName, uiState.selectedVoice) + voices.map { it.name } + speakersForModel(chunkModelName)).distinct()
-                             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(Modifier.fillMaxWidth().testTag(BatchUiTestTags.chunk(chunk.index)), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                  Box {
                                      OutlinedButton(onClick = { configurationOpen = true }, enabled = !workflowBusy) { Text("M/P") }
                                      DropdownMenu(expanded = configurationOpen, onDismissRequest = { configurationOpen = false }) {
                                         Column(Modifier.width(420.dp).padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            Text("Chunk ${chunk.index} configuration", style = MaterialTheme.typography.labelLarge)
+                                            Text("Chunk ${chunk.displayIndex} configuration", style = MaterialTheme.typography.labelLarge)
                                             Text("Model", style = MaterialTheme.typography.labelSmall)
                                             availableModelNames.forEach { option ->
                                                 DropdownMenuItem(
@@ -543,7 +707,7 @@ fun BatchScreen(
                                         }
                                     }
                                 }
-                                 Text("${chunk.index}: ${if (isSavingChunk) "SAVING" else chunk.status} · ${chunk.text.replace("\n", " ").take(90)}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
+                                 Text("${chunk.displayIndex}: ${if (isSavingChunk) "SAVING" else chunk.status} · ${chunk.text.replace("\n", " ").take(90)}", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)
                                 if (batchState.isRunning && batchState.currentIndex == chunk.index) {
                                     Column(Modifier.width(120.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                                         Text("Generating...", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
@@ -554,7 +718,7 @@ fun BatchScreen(
                                     IconButton(onClick = { textDetailsOpen = true }) { Text("T", style = MaterialTheme.typography.labelMedium) }
                                     DropdownMenu(expanded = textDetailsOpen, onDismissRequest = { textDetailsOpen = false }) {
                                         Column(Modifier.width(420.dp).padding(12.dp)) {
-                                            Text("Chunk ${chunk.index} text", style = MaterialTheme.typography.labelLarge)
+                                            Text("Chunk ${chunk.displayIndex} text", style = MaterialTheme.typography.labelLarge)
                                             val isPlaying = batchState.playingChunkIndex == chunk.index
                                              val fraction = if (isPlaying && batchState.chunkPlaybackDurationSeconds > 0f) {
                                                  (batchState.chunkPlaybackPositionSeconds / batchState.chunkPlaybackDurationSeconds).coerceIn(0f, 1f)
@@ -586,15 +750,15 @@ fun BatchScreen(
                                 }
                                 IconButton(
                                     onClick = { viewModel.playBatchChunk(manifestFile?.parentFile?.resolve(chunk.fileName) ?: File(batchOutputDirectory, chunk.fileName)) },
-                                    enabled = chunk.status == BatchChunkStatus.COMPLETE && !workflowBusy
+                                    enabled = chunk.status == BatchChunkStatus.COMPLETE && !validationActive
                                 ) { Icon(Icons.Filled.PlayArrow, contentDescription = "Play chunk") }
                                 IconButton(
                                     onClick = { viewModel.playBatchChunkWindow(manifestFile?.parentFile?.resolve(chunk.fileName) ?: File(batchOutputDirectory, chunk.fileName), true) },
-                                    enabled = chunk.status == BatchChunkStatus.COMPLETE && !workflowBusy
+                                    enabled = chunk.status == BatchChunkStatus.COMPLETE && !validationActive
                                 ) { Text("P", style = MaterialTheme.typography.labelMedium) }
                                 IconButton(
                                     onClick = { viewModel.playBatchChunkWindow(manifestFile?.parentFile?.resolve(chunk.fileName) ?: File(batchOutputDirectory, chunk.fileName), false) },
-                                    enabled = chunk.status == BatchChunkStatus.COMPLETE && !workflowBusy
+                                    enabled = chunk.status == BatchChunkStatus.COMPLETE && !validationActive
                                 ) { Text("S", style = MaterialTheme.typography.labelMedium) }
                                 if (batchState.playingChunkIndex == chunk.index) {
                                     Slider(
@@ -610,7 +774,10 @@ fun BatchScreen(
                                      OutlinedButton(
                                          onClick = {
                                              val replay = batchReplayRequest ?: return@OutlinedButton
-                                             viewModel.startBatchGeneration(replay.copy(regenerateIndices = if (chunk.status == BatchChunkStatus.COMPLETE) setOf(chunk.index) else emptySet(), onlyIndices = setOf(chunk.index), chunkVoices = chunkVoiceParameters(manifest)))
+                                             viewModel.startBatchGeneration(
+                                                 replay.copy(regenerateIndices = if (chunk.status == BatchChunkStatus.COMPLETE) setOf(chunk.index) else emptySet(), onlyIndices = setOf(chunk.index), chunkVoices = chunkVoiceParameters(manifest)),
+                                                 incrementalValidation = incrementalBatchValidation
+                                             )
                                          },
                                          enabled = !workflowBusy
                                      ) {
@@ -625,12 +792,26 @@ fun BatchScreen(
                                  }
                                 if (manifestFile != null) {
                                     IconButton(
-                                        onClick = { validationJob = viewModel.validateBatchChunk(manifestFile, chunk.index, asrModelFile.takeIf { it.isFile }, batchSourceFile) },
+                                        onClick = { validationJob = viewModel.validateBatchChunk(manifestFile, chunk.index, asrModelFile.takeIf { it.isFile }, batchSourceFile, asrBackend = backendPreference) },
+                                        modifier = Modifier.testTag(BatchUiTestTags.validateChunk(chunk.index)),
                                         enabled = chunk.status == BatchChunkStatus.COMPLETE && !workflowBusy
                                     ) { Text("V", style = MaterialTheme.typography.titleMedium) }
                                 }
                                 Box {
-                                     IconButton(onClick = { validationDetailsOpen = true }, enabled = validation?.passed == false) {
+                                     IconButton(
+                                         onClick = { validationDetailsOpen = true },
+                                         modifier = Modifier
+                                             .testTag(BatchUiTestTags.validationState(chunk.index))
+                                             .semantics {
+                                                 stateDescription = when {
+                                                     validation?.isRunning == true -> "running"
+                                                     validation?.passed == true -> "passed"
+                                                     validation?.passed == false -> "failed"
+                                                     else -> "pending"
+                                                 }
+                                             },
+                                         enabled = validation?.passed == false
+                                     ) {
                                         when {
                                             validation?.isRunning == true -> Icon(Icons.Filled.HourglassEmpty, "Validation running", tint = MaterialTheme.colorScheme.primary)
                                             validation?.passed == true -> Icon(Icons.Filled.CheckCircle, "Validation passed", tint = androidx.compose.ui.graphics.Color(0xFF2E7D32))
@@ -665,9 +846,7 @@ fun BatchScreen(
                                     }
                                 }
                             }
-                        }
-                        if (manifest.chunks.size == manifest.expectedChunkCount && manifest.chunks.all { it.status == BatchChunkStatus.COMPLETE } && !workflowBusy) {
-                            OutlinedButton(onClick = { batchRecombineSaver.launch(baseName = "batch-combined", extension = "wav") }) { Text("Combine") }
+                            }
                         }
                         batchManifestPath?.let { path ->
                             Text(if (asrModelFile.isFile) "ASR model installed by Setup" else "Install the ASR model from Model Settings", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -676,7 +855,7 @@ fun BatchScreen(
                             Text("Validation is running; batch file writes are paused until it finishes.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                         batchState.validationReport?.let { report ->
-                            Text("Validation: ${report.errors.size} errors, ${report.warnings.size} warnings", style = MaterialTheme.typography.bodySmall)
+                            Text("Validation: ${report.errors.size} errors, ${report.warnings.size} warnings", modifier = Modifier.testTag(BatchUiTestTags.validationSummary), style = MaterialTheme.typography.bodySmall)
                             if (false && report.asrFindings.isNotEmpty()) {
                                 Text("ASR findings (${report.asrFindings.size})", style = MaterialTheme.typography.labelLarge)
                                 report.asrFindings.forEach { finding ->
@@ -713,7 +892,12 @@ fun BatchScreen(
                             val replay = batchReplayRequest
                             if (replay != null) {
                                 runCatching { parseChunkSelection(batchRegenerateSelection, replay.texts.size) }
-                                    .onSuccess { viewModel.startBatchGeneration(replay.copy(regenerateIndices = it, chunkVoices = batchState.manifest?.let(::chunkVoiceParameters) ?: replay.chunkVoices)) }
+                                    .onSuccess {
+                                        viewModel.startBatchGeneration(
+                                            replay.copy(regenerateIndices = it, chunkVoices = batchState.manifest?.let(::chunkVoiceParameters) ?: replay.chunkVoices),
+                                            incrementalValidation = incrementalBatchValidation
+                                        )
+                                    }
                                     .onFailure { viewModel.reportBatchError(it.message ?: "Invalid chunk selection.") }
                             } else {
                                 val defaultBatchVoice = batchVoiceParameters(batchVoiceName, batchModelName, batchVoicePrompt)
@@ -752,12 +936,14 @@ fun BatchScreen(
                                         iclPromptSha256 = BatchIdentity.sha256FileOrNull(effectiveIcl),
                                         outputDirectory = File(batchOutputDirectory).toPath(),
                                         allowIncompatibleReplacement = allowIncompatibleReplacement,
+                                        allowAdaptiveRechunking = true,
                                         defaultVoiceName = batchVoiceName,
                                         chunkVoices = batchTexts.indices.associateWith { index -> batchVoiceParameters(batchVoiceNames[index] ?: batchVoiceName, batchModelNames[index] ?: batchModelName, batchVoicePrompts[index] ?: instruction) }
-                                    )
+                                    ),
+                                    incrementalValidation = incrementalBatchValidation
                                 )
                             }
-                        }, enabled = batchTexts.isNotEmpty() && batchOutputDirectory.isNotBlank() && !capturedVoiceInvalid && !uiState.isGenerating && !workflowBusy && (batchReplayRequest != null || !missingSpeakerEmbedding) && (batchReplayRequest != null || !missingIclPrompt)) {
+                        }, modifier = Modifier.testTag(BatchUiTestTags.start), enabled = batchTexts.isNotEmpty() && batchOutputDirectory.isNotBlank() && !capturedVoiceInvalid && !uiState.isGenerating && !workflowBusy && (batchReplayRequest != null || !missingSpeakerEmbedding) && (batchReplayRequest != null || !missingIclPrompt)) {
                             Text(if (batchReplayRequest != null && batchRegenerateSelection.isNotBlank()) "Regenerate selected" else if (batchReplayRequest != null) "Continue batch" else "Start batch")
                         }
                     }
@@ -782,6 +968,13 @@ fun BatchScreen(
 private fun formatBatchDuration(milliseconds: Long): String {
     val totalSeconds = (milliseconds / 1_000L).coerceAtLeast(0L)
     return if (totalSeconds >= 60) "${totalSeconds / 60}m %02ds".format(totalSeconds % 60) else "${totalSeconds}s"
+}
+
+private enum class BatchChunkFilter(val label: String) {
+    All("All"),
+    NeedsAttention("Needs attention"),
+    Complete("Complete"),
+    Validated("Validated")
 }
 
 private fun parseChunkSelection(selection: String, total: Int): Set<Int> {

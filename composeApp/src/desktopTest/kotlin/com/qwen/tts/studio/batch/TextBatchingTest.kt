@@ -37,6 +37,53 @@ class TextBatchingTest {
     }
 
     @Test
+    fun smallCharacterPlansKeepSeparatorsOutOfStandaloneChunks() {
+        val source = "A\n\nB"
+        val chunks = TextBatching.packParagraphsForGeneration(source, 1)
+
+        assertEquals(source, chunks.joinToString(separator = ""))
+        assertTrue(chunks.all(String::isNotBlank))
+    }
+
+    @Test
+    fun generationPlansKeepClosingPunctuationWithSpeech() {
+        val source = "第一句内容很长很长很长很长。\"\r\n第二句内容也很长很长很长。"
+        val chunks = TextBatching.packParagraphsForGeneration(source, 16)
+
+        assertEquals(source, chunks.joinToString(separator = ""))
+        assertTrue(chunks.all { piece -> piece.any(Char::isLetterOrDigit) })
+    }
+
+    @Test
+    fun losslessSplittingPrefersSentenceBoundariesForCjkText() {
+        val source = "第一句内容很长很长。第二句内容也很长很长。第三句继续测试。"
+        val chunks = TextBatching.packParagraphs(source, 16)
+
+        assertEquals(source, chunks.joinToString(separator = ""))
+        assertTrue(chunks.dropLast(1).all { it.endsWith('。') })
+    }
+
+    @Test
+    fun rebalancesNearLimitTailInsteadOfCreatingTinyAudioChunk() {
+        val source = "word ".repeat(68)
+        val chunks = TextBatching.packParagraphs(source, 336)
+
+        assertEquals(source, chunks.joinToString(separator = ""))
+        assertTrue(chunks.all { it.length <= 336 })
+        assertTrue(chunks.all { it.length >= 64 })
+    }
+
+    @Test
+    fun generationPackingRebalancesSmallRecoveryTails() {
+        val source = "中".repeat(44)
+        val chunks = TextBatching.packParagraphsForGeneration(source, 20)
+
+        assertEquals(source, chunks.joinToString(separator = ""))
+        assertTrue(chunks.all { it.length <= 20 })
+        assertTrue(chunks.all { it.length >= 10 })
+    }
+
+    @Test
     fun treatsWhitespaceOnlyLinesAsParagraphSeparators() {
         assertEquals(
             listOf("first paragraph\n \t\nsecond paragraph"),
@@ -64,5 +111,73 @@ class TextBatchingTest {
         assertEquals(source, chunks.joinToString(separator = ""))
         assertEquals(source.length, chunks.sumOf(String::length))
         assertTrue(chunks.all { it.length <= 5_000 })
+    }
+
+    @Test
+    fun adaptiveAudioReplanIsLosslessAndMakesContextLimitedPiecesSafe() {
+        val source = "word ".repeat(240)
+        val tokenCount = { text: String -> text.length * 5 }
+
+        val pieces = TextBatching.replanForAudioBudget(
+            source = source,
+            customVoice = true,
+            textTokenCount = tokenCount,
+            instruction = "Calm narrator"
+        )
+
+        assertTrue(pieces.size > 1)
+        assertEquals(source, pieces.joinToString(separator = ""))
+        assertTrue(
+            pieces.all {
+                !BatchMemoryPolicy.audioBudget(
+                    TextBatching.cleanForSynthesis(it),
+                    customVoice = true,
+                    textTokenCount = tokenCount(TextBatching.cleanForSynthesis(it)),
+                    instruction = "Calm narrator"
+                ).requiresRechunk
+            }
+        )
+    }
+
+    @Test
+    fun adaptiveAudioReplanMergesShortHeadingIntoSafeNeighbor() {
+        val source = "A Gardener's Touch\n\nPart I\n\n" + "word ".repeat(240)
+        val tokenCount = { text: String -> text.length * 5 }
+
+        val pieces = TextBatching.replanForAudioBudget(
+            source = source,
+            customVoice = true,
+            textTokenCount = tokenCount,
+            instruction = "Calm narrator"
+        )
+
+        assertEquals(source, pieces.joinToString(separator = ""))
+        assertTrue(pieces.first().length >= 64)
+        assertTrue(
+            pieces.all {
+                BatchMemoryPolicy.audioBudget(
+                    TextBatching.cleanForSynthesis(it),
+                    customVoice = true,
+                    textTokenCount = tokenCount(TextBatching.cleanForSynthesis(it)),
+                    instruction = "Calm narrator"
+                ).hasNativeHeadroom
+            }
+        )
+    }
+
+    @Test
+    fun adaptiveAudioReplanDoesNotReturnWhitespaceOnlyPieces() {
+        val source = "A\n\nB"
+        val tokenCount = { text: String -> text.length * 3_500 }
+
+        val pieces = TextBatching.replanForAudioBudget(
+            source = source,
+            customVoice = true,
+            textTokenCount = tokenCount,
+            instruction = null
+        )
+
+        assertEquals(source, pieces.joinToString(separator = ""))
+        assertTrue(pieces.all(String::isNotBlank))
     }
 }

@@ -134,6 +134,16 @@ Packaged Windows builds use an AVX2 CPU baseline and explicitly disable AVX-512 
 - **`UnsatisfiedLinkError` for a new native method:** Rebuild the native backend and restart the app. On Windows, run `.\scripts\run-compose.ps1 -Cuda -BuildNative` or `pwsh -ExecutionPolicy Bypass -File .\scripts\build-native.ps1 -Cuda`. The JVM cannot reload an already-loaded DLL inside the same app process.
 - **Submodules Not Found:** If `external/qwen3-tts-cpp` is empty, run `git submodule update --init --recursive`.
 
+### Headless batch verification
+
+For a headless application-boundary check, run the normal desktop entry point in deterministic fake mode:
+
+```powershell
+.\gradlew.bat :composeApp:run --args="--headless-batch-verify --output-dir D:\temp\qwen-headless-batch-verification"
+```
+
+The command drives the Studio batch workflow through generation, deterministic validation, and WAV recombination. It writes `batch-verification-report.json` alongside the input, manifest, chunks, and combined WAV. A compatibility copy remains available as `agent-report.json`. Use `--mode native --model-dir <dir> --model-name <file>` after a native build when model/JNI evidence is required. Fake mode verifies orchestration and artifact handling; it does not prove native inference or playback.
+
 ### Portable batch smoke test
 
 After building the portable app, prepare an isolated two-line UTF-8 fixture and verify the model prerequisite with:

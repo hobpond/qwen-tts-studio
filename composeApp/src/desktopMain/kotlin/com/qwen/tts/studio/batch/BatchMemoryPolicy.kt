@@ -20,6 +20,23 @@ data class BatchMemoryPlan(
     val hasCapacity: Boolean get() = maxCharacters != null
 }
 
+data class BatchAudioBudget(
+    val durationTokens: Int,
+    val contextTokens: Int,
+    val maxAudioTokens: Int
+) {
+    /** True when this piece can be joined to a short neighbor without using the native floor. */
+    val hasNativeHeadroom: Boolean
+        get() = contextTokens >= BatchMemoryPolicy.MIN_AUDIO_CONTEXT_TOKENS &&
+            durationTokens.toLong() * 10L < BatchMemoryPolicy.NATIVE_AUDIO_TOKEN_FLOOR * 9L
+
+    /** True when the text/context budget leaves too little headroom for safe generation. */
+    val requiresRechunk: Boolean
+        get() = contextTokens < BatchMemoryPolicy.MIN_AUDIO_CONTEXT_TOKENS ||
+            durationTokens.toLong() * 10L >= contextTokens.toLong() * 9L ||
+            durationTokens.toLong() * 10L >= BatchMemoryPolicy.AUDIO_REPLAN_REFERENCE_TOKENS * 9L
+}
+
 /** Conservative, platform-neutral limits derived from currently observable memory. */
 object BatchMemoryPolicy {
     private const val MIN_CHARACTERS = 800
@@ -27,6 +44,7 @@ object BatchMemoryPolicy {
     private const val MAX_SAFE_CHARACTERS = 5_000
     private const val SAFE_BATCH_CHARACTERS = 4_000
     private const val MAX_AUDIO_TOKENS = 4_096
+    private const val CONTEXT_RESERVE_TOKENS = 8
     private const val SAFE_AUDIO_TOKENS = 3_584
     private const val AUDIO_SAMPLES_PER_TOKEN = 1_920
     private const val FLOAT_BYTES = 4L
@@ -35,6 +53,10 @@ object BatchMemoryPolicy {
     private const val PERSISTENCE_BUFFERS_AT_PEAK = 2L
     private const val FIXED_PEAK_OVERHEAD = 128L * 1024L * 1024L
     private const val AVAILABLE_MEMORY_FRACTION = 0.60
+    const val MIN_AUDIO_CONTEXT_TOKENS = 569
+    const val NATIVE_AUDIO_TOKEN_FLOOR = 512L
+    /** Conservative target that leaves room below the native 512-token floor. */
+    const val AUDIO_REPLAN_REFERENCE_TOKENS = 384L
 
     fun snapshot(backend: QwenEngine.BackendMemory?): BatchMemorySnapshot {
         val os = ManagementFactory.getOperatingSystemMXBean() as? OperatingSystemMXBean
@@ -83,12 +105,51 @@ object BatchMemoryPolicy {
         )
     }
 
-    /** Leaves headroom below the native 4096-token ceiling for natural speech expansion. */
-    fun maxAudioTokens(text: String): Int =
-        ceil(text.length * SAFE_AUDIO_TOKENS / SAFE_BATCH_CHARACTERS.toDouble())
-            .toInt().coerceIn(512, SAFE_AUDIO_TOKENS)
+    /**
+     * Computes the output-frame budget for the actual voice mode. CustomVoice
+     * speakers can be substantially slower than Base/VoiceDesign, so applying
+     * the normal 3584-frame ceiling to them falsely treats a valid long result
+     * as clipped. The native ceiling remains the hard upper bound.
+     */
+    fun maxAudioTokens(
+        text: String,
+        customVoice: Boolean = false,
+        textTokenCount: Int? = null,
+        instruction: String? = null
+    ): Int = audioBudget(text, customVoice, textTokenCount, instruction).maxAudioTokens
 
-    fun maxAudioSamples(text: String): Long = maxAudioTokens(text).toLong() * AUDIO_SAMPLES_PER_TOKEN
+    fun audioBudget(
+        text: String,
+        customVoice: Boolean = false,
+        textTokenCount: Int? = null,
+        instruction: String? = null
+    ): BatchAudioBudget {
+        val safeCeiling = if (customVoice) MAX_AUDIO_TOKENS else SAFE_AUDIO_TOKENS
+        val durationBudget = ceil(text.length * safeCeiling / SAFE_BATCH_CHARACTERS.toDouble()).toInt()
+        // The native talker cache has one shared context for the formatted
+        // text prefix and generated audio frames. Passing 4096 output frames
+        // does not make 4096 frames available when the text already occupies
+        // part of that context; native generation otherwise stops mid-suffix.
+        val measuredTextTokens = textTokenCount?.takeIf { it > 0 }
+            ?: ceil(text.length * 0.25).toInt() + CONTEXT_RESERVE_TOKENS
+        val instructionTokens = instruction?.takeIf { it.isNotBlank() }?.let {
+            ceil(it.length * 0.25).toInt() + CONTEXT_RESERVE_TOKENS
+        } ?: 0
+        val contextBudget = MAX_AUDIO_TOKENS - measuredTextTokens - instructionTokens - CONTEXT_RESERVE_TOKENS
+        return BatchAudioBudget(
+            durationTokens = durationBudget,
+            contextTokens = contextBudget,
+            maxAudioTokens = min(durationBudget, contextBudget.coerceAtLeast(NATIVE_AUDIO_TOKEN_FLOOR.toInt()))
+                .coerceIn(NATIVE_AUDIO_TOKEN_FLOOR.toInt(), safeCeiling)
+        )
+    }
+
+    fun maxAudioSamples(
+        text: String,
+        customVoice: Boolean = false,
+        textTokenCount: Int? = null,
+        instruction: String? = null
+    ): Long = maxAudioTokens(text, customVoice, textTokenCount, instruction).toLong() * AUDIO_SAMPLES_PER_TOKEN
 
     /**
      * Estimates the peak host-side bytes for one generation while the previous

@@ -43,6 +43,8 @@ kotlin {
 
         desktopTest.dependencies {
             implementation(kotlin("test"))
+            implementation(compose.desktop.uiTestJUnit4)
+            implementation(compose.desktop.currentOs)
         }
         
         desktopMain.dependencies {
@@ -70,6 +72,9 @@ compose.desktop {
 
         jvmArgs += "-Xss16m"
         jvmArgs += "-Djna.protected=false"
+        providers.gradleProperty("nativeRuntimeRoot").orNull
+            ?.takeIf { it.isNotBlank() }
+            ?.let { jvmArgs += "-Djna.library.path=$it" }
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)

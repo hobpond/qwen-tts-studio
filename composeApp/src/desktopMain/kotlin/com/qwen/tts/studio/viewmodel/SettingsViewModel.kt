@@ -52,7 +52,13 @@ data class ModelDownloadState(
  * ViewModel for managing application settings, specifically model paths and variants.
  * Handles persistence of settings using a properties file in the user's home directory.
  */
-class SettingsViewModel : ViewModel() {
+class SettingsViewModel(
+    /**
+     * Test harnesses may opt out of writing user preferences while still
+     * exercising the real settings flows and mutators.
+     */
+    private val persistSettings: Boolean = true
+) : ViewModel() {
     companion object {
         private const val HUGGING_FACE_REPO = "Serveurperso/Qwen3-TTS-GGUF"
         private const val HF_BASE_URL = "https://huggingface.co/$HUGGING_FACE_REPO/resolve/main"
@@ -317,6 +323,7 @@ class SettingsViewModel : ViewModel() {
     }
 
     private fun saveAll() {
+        if (!persistSettings) return
         try {
             val file = settingsFile()
             file.parentFile?.mkdirs()

@@ -6,12 +6,16 @@ internal object BatchManifestCodec {
         val batchId = JsonReader(json).string("batchId") ?: error("Manifest is missing batchId")
         val expected = JsonReader(json).number("expectedChunkCount")?.toInt()
             ?: error("Manifest is missing expectedChunkCount")
+        val revision = JsonReader(json).number("manifestRevision") ?: 0L
         val metadata = JsonReader(JsonReader(json).objectValue("metadata") ?: "{}").stringMap()
         val chunksJson = JsonReader(json).arrayValue("chunks") ?: error("Manifest is missing chunks")
         val chunks = JsonReader.objects(chunksJson).map { objectJson ->
             val reader = JsonReader(objectJson)
             BatchChunk(
                 index = reader.number("index")?.toInt() ?: error("Chunk is missing index"),
+                displayIndex = reader.string("displayIndex")
+                    ?: reader.number("index")?.toInt()?.toString()
+                    ?: error("Chunk is missing index"),
                 fileName = reader.string("fileName") ?: error("Chunk is missing fileName"),
                 text = reader.string("text") ?: "",
                 status = reader.string("status")?.let { BatchChunkStatus.valueOf(it) } ?: BatchChunkStatus.PENDING,
@@ -27,7 +31,7 @@ internal object BatchManifestCodec {
                 validationSignature = reader.string("validationSignature")
             )
         }
-        return BatchManifest(batchId, expected, chunks, metadata)
+        return BatchManifest(batchId, expected, chunks, metadata, revision)
     }
 
     private class JsonReader(private val json: String) {

@@ -8,6 +8,34 @@ import kotlin.test.assertTrue
 
 class QwenAsrEngineTest {
     @Test
+    fun cpuIsTheDefaultAndBackendPreferenceCrossesNativeSeam() {
+        val native = FakeNativeApi(loadResult = true)
+        val engine = QwenAsrEngine(native)
+
+        assertEquals(NativeBackendPreference.Cpu, native.initializedPreference)
+        engine.close()
+    }
+
+    @Test
+    fun cudaMustBeRequestedExplicitlyAndBackendEvidenceIsObservable() {
+        val native = FakeNativeApi(
+            loadResult = true,
+            backendName = "CUDA0",
+            backendEvidence = longArrayOf(1, 1, 1, 5_000L, 8_000L)
+        )
+        val engine = QwenAsrEngine(native, NativeBackendPreference.Cuda)
+
+        assertEquals(NativeBackendPreference.Cuda, native.initializedPreference)
+        val info = engine.backendInfo()
+        assertEquals("CUDA0", info?.name)
+        assertTrue(info?.gpuActive == true)
+        assertTrue(info?.weightsOnGpu == true)
+        assertEquals(5_000L, info?.freeBytes)
+        assertEquals(8_000L, info?.totalBytes)
+        engine.close()
+    }
+
+    @Test
     fun validationWindowsNeverMaterializeMoreThanFiveSeconds() {
         val samples = FloatArray(AsrAudioWindow.MAX_SAMPLES + 100) { it.toFloat() }
 
@@ -36,15 +64,34 @@ class QwenAsrEngineTest {
     }
 
     private class FakeNativeApi(private val loadResult: Boolean) : QwenAsrNativeApi {
-        val freedPointers = mutableListOf<Long>()
+        constructor(
+            loadResult: Boolean,
+            backendName: String,
+            backendEvidence: LongArray
+        ) : this(loadResult) {
+            this.backendName = backendName
+            this.backendEvidence = backendEvidence
+        }
 
-        override fun init(): Long = 7L
+        val freedPointers = mutableListOf<Long>()
+        var initializedPreference: NativeBackendPreference? = null
+        private var backendName = "CPU"
+        private var backendEvidence = longArrayOf(0, 0, 0, -1, -1)
+
+        override fun init(backendPreference: NativeBackendPreference): Long {
+            initializedPreference = backendPreference
+            return 7L
+        }
 
         override fun free(ptr: Long) {
             freedPointers += ptr
         }
 
         override fun loadModel(ptr: Long, modelPath: String): Boolean = loadResult
+
+        override fun backendName(ptr: Long): String = backendName
+
+        override fun backendEvidence(ptr: Long): LongArray = backendEvidence
 
         override fun transcribe(
             ptr: Long,

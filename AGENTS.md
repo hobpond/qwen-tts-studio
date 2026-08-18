@@ -19,7 +19,8 @@ For OKF authoring, validation, or review, follow the project-local [`skills/okf/
 ```powershell
 pwsh -ExecutionPolicy Bypass -File .\scripts\build-native.ps1
 .\gradlew.bat :composeApp:run
-.\gradlew.bat :composeApp:test
+.\gradlew.bat :composeApp:desktopTest
+.\gradlew.bat :composeApp:run --args="--headless-batch-verify --output-dir D:\temp\qwen-headless-batch-verification"
 ```
 
 For CUDA, use `-Cuda` with the native build/run/package scripts. See [`docs/BUILD.md`](docs/BUILD.md) for packaging and platform-specific prerequisites.

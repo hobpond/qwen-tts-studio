@@ -7,9 +7,68 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class BatchGenerationTest {
+    @Test
+    fun manifestRecordsModelAndNativeRuntimeFingerprintsAndRejectsRuntimeDrift() {
+        val root = Files.createTempDirectory("batch-provenance")
+        val model = root.resolve("model.gguf")
+        Files.write(model, byteArrayOf(1, 2, 3, 4))
+        val nativeLibrary = QwenEngine.NativeRuntimeArtifact(
+            role = "native-library",
+            fileName = "qwen3_tts.dll",
+            absolutePath = root.resolve("qwen3_tts.dll").toString(),
+            sizeBytes = 10,
+            sha256 = "dll-fingerprint-a"
+        )
+        val dependency = QwenEngine.NativeRuntimeArtifact(
+            role = "ggml-backend",
+            fileName = "ggml-cuda.dll",
+            absolutePath = root.resolve("ggml-cuda.dll").toString(),
+            sizeBytes = 20,
+            sha256 = "dependency-fingerprint"
+        )
+        val fake = RecordingBatchEngine()
+        fake.runtime = QwenEngine.NativeRuntimeIdentity(
+            rootPath = root.toString(),
+            nativeLibrary = nativeLibrary,
+            dependencies = listOf(dependency),
+            activeBackendName = "CPU",
+            compiledBackendMask = QwenEngine.BACKEND_CPU
+        )
+        val request = BatchGenerationRequest(
+            batchId = "provenance",
+            modelDir = root.toString(),
+            modelName = model.fileName.toString(),
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("Fingerprint this chunk."),
+            languageId = 2050,
+            instruction = null,
+            speaker = "speaker-1",
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val generated = BatchGenerationSession(fake, BatchAudioStore(root)).run(request)
+        val manifest = BatchAudioStore(root).loadManifest()
+
+        assertEquals(BatchGenerationStatus.COMPLETED, generated.status)
+        assertEquals(BatchIdentity.sha256File(model.toFile()), manifest.metadata["modelFileSha256"])
+        assertEquals("4", manifest.metadata["modelFileSizeBytes"])
+        assertEquals("dll-fingerprint-a", manifest.metadata["nativeLibrarySha256"])
+        assertEquals("dependency-fingerprint", manifest.metadata["nativeDependency.0.sha256"])
+        assertTrue(manifest.metadata["nativeRuntimeFingerprint"].orEmpty().isNotBlank())
+
+        fake.runtime = fake.runtime!!.copy(nativeLibrary = nativeLibrary.copy(sha256 = "dll-fingerprint-b"))
+        val drifted = BatchGenerationSession(fake, BatchAudioStore(root)).run(request)
+
+        assertEquals(BatchGenerationStatus.FAILED, drifted.status)
+        assertTrue(drifted.error.orEmpty().contains("different model or native runtime fingerprint"))
+    }
+
     @Test
     fun loadsOnceAndGeneratesSequentialChunksThroughReusableEngine() {
         val root = Files.createTempDirectory("batch-generation")
@@ -36,6 +95,14 @@ class BatchGenerationTest {
         assertEquals(1, fake.loadCalls)
         assertEquals(listOf(firstText, secondText), fake.generatedTexts)
         assertEquals(listOf(firstText, secondText), result.manifest.chunks.map { it.text })
+        assertEquals(
+            BatchMemoryPolicy.maxAudioTokens(firstText).toString(),
+            result.manifest.metadata[BatchValidationMetadata.audioCapTokensKey(0)]
+        )
+        assertEquals(
+            BatchMemoryPolicy.maxAudioTokens(secondText).toString(),
+            result.manifest.metadata[BatchValidationMetadata.audioCapTokensKey(1)]
+        )
         assertTrue(Files.exists(root.resolve("manifest.json")))
         assertTrue(Files.exists(BatchAudioStore(root).recombine(result.manifest, root.resolve("combined.wav"))))
     }
@@ -73,6 +140,301 @@ class BatchGenerationTest {
     }
 
     @Test
+    fun incrementalValidationRetriesBeforeAdmittingTheNextChunk() {
+        val root = Files.createTempDirectory("batch-incremental-validation")
+        val events = mutableListOf<String>()
+        val fake = RecordingBatchEngine(onGenerate = { text -> events += "generate:${text.first()}" })
+        val attempts = mutableMapOf<Int, Int>()
+        val validator = BatchChunkValidator { _, index ->
+            events += "validate:$index"
+            val attempt = (attempts[index] ?: 0) + 1
+            attempts[index] = attempt
+            val passed = index != 0 || attempt > 1
+            BatchChunkValidationResult(
+                chunkIndex = index,
+                passed = passed,
+                message = if (passed) "passed" else "transient ASR mismatch",
+                deterministic = BatchValidationReport(emptyList())
+            )
+        }
+        val request = BatchGenerationRequest(
+            batchId = "incremental-validation",
+            modelDir = root.toString(),
+            modelName = null,
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("first", "second"),
+            languageId = 2050,
+            instruction = null,
+            speaker = null,
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(
+            request,
+            incrementalValidation = BatchIncrementalValidationPolicy(validator, maxRetries = 1)
+        )
+
+        assertEquals(BatchGenerationStatus.COMPLETED, result.status)
+        assertEquals(
+            listOf("generate:f", "validate:0", "generate:f", "validate:0", "generate:s", "validate:1"),
+            events
+        )
+        assertEquals(3, fake.generatedTexts.size)
+        assertTrue(result.manifest.chunks.all { it.validationPassed == true })
+    }
+
+    @Test
+    fun incrementalValidationStopsOnPersistentFailureBeforeNextChunk() {
+        val root = Files.createTempDirectory("batch-incremental-validation-failure")
+        val events = mutableListOf<String>()
+        val fake = RecordingBatchEngine(onGenerate = { text -> events += "generate:${text.first()}" })
+        val validator = BatchChunkValidator { _, index ->
+            events += "validate:$index"
+            BatchChunkValidationResult(
+                chunkIndex = index,
+                passed = false,
+                message = "persistent ASR mismatch",
+                deterministic = BatchValidationReport(emptyList())
+            )
+        }
+        val request = BatchGenerationRequest(
+            batchId = "incremental-validation-failure",
+            modelDir = root.toString(),
+            modelName = null,
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("first", "second"),
+            languageId = 2050,
+            instruction = null,
+            speaker = null,
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(
+            request,
+            incrementalValidation = BatchIncrementalValidationPolicy(validator, maxRetries = 1)
+        )
+
+        assertEquals(BatchGenerationStatus.FAILED, result.status)
+        assertEquals(listOf("generate:f", "validate:0", "generate:f", "validate:0"), events)
+        assertEquals(BatchChunkStatus.COMPLETE, result.manifest.chunks.first().status)
+        assertEquals(false, result.manifest.chunks.first().validationPassed)
+        assertEquals(BatchChunkStatus.PENDING, result.manifest.chunks.last().status)
+    }
+
+    @Test
+    fun incrementalGenerationFailureRetriesBeforeAdmittingTheNextChunk() {
+        val root = Files.createTempDirectory("batch-incremental-generation-retry")
+        val events = mutableListOf<String>()
+        var firstChunkAttempts = 0
+        val fake = RecordingBatchEngine(
+            onGenerate = { text -> events += "generate:${text.first()}" },
+            resultFor = { text, _ ->
+                if (text == "first" && firstChunkAttempts++ == 0) {
+                    QwenEngine.NativeResult(null, 24_000, false, "temporary native failure", 1L)
+                } else {
+                    QwenEngine.NativeResult(floatArrayOf(0f, 0.1f), 24_000, true, null, 1L)
+                }
+            }
+        )
+        val validator = BatchChunkValidator { _, index ->
+            events += "validate:$index"
+            BatchChunkValidationResult(
+                chunkIndex = index,
+                passed = true,
+                message = "passed",
+                deterministic = BatchValidationReport(emptyList())
+            )
+        }
+        val request = BatchGenerationRequest(
+            batchId = "incremental-generation-retry",
+            modelDir = root.toString(),
+            modelName = null,
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("first", "second"),
+            languageId = 2050,
+            instruction = null,
+            speaker = null,
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(
+            request,
+            incrementalValidation = BatchIncrementalValidationPolicy(validator, maxRetries = 1)
+        )
+
+        assertEquals(BatchGenerationStatus.COMPLETED, result.status)
+        assertEquals(
+            listOf("generate:f", "generate:f", "validate:0", "generate:s", "validate:1"),
+            events
+        )
+        assertTrue(result.manifest.chunks.all { it.validationPassed == true })
+    }
+
+    @Test
+    fun queuedValidationLetsTheNextChunkGenerateWhileAsrIsBusy() {
+        val root = Files.createTempDirectory("batch-queued-validation")
+        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val validationStarted = CountDownLatch(1)
+        val releaseValidation = CountDownLatch(1)
+        val generatedWhileValidationBlocked = java.util.concurrent.atomic.AtomicBoolean(false)
+        val validationReleased = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fake = RecordingBatchEngine(onGenerate = { text ->
+            events += "generate:${text.first()}"
+            if (text == "second") {
+                require(validationStarted.await(1, TimeUnit.SECONDS)) { "ASR worker did not start the first validation" }
+                generatedWhileValidationBlocked.set(!validationReleased.get())
+                releaseValidation.countDown()
+            }
+        })
+        val validator = BatchChunkValidator { _, index ->
+            if (index == 0) {
+                events += "validate-start:0"
+                validationStarted.countDown()
+                require(releaseValidation.await(1, TimeUnit.SECONDS)) { "Test did not release queued validation" }
+            }
+            events += "validate:$index"
+            BatchChunkValidationResult(
+                chunkIndex = index,
+                passed = true,
+                message = "passed",
+                deterministic = BatchValidationReport(emptyList())
+            )
+        }
+        val request = BatchGenerationRequest(
+            batchId = "queued-validation",
+            modelDir = root.toString(),
+            modelName = null,
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("first", "second"),
+            languageId = 2050,
+            instruction = null,
+            speaker = null,
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(
+            request,
+            incrementalValidation = BatchIncrementalValidationPolicy(
+                validator = validator,
+                maxRetries = 1,
+                mode = BatchValidationMode.QUEUED,
+                maxQueuedValidations = 1
+            )
+        )
+
+        assertEquals(BatchGenerationStatus.COMPLETED, result.status)
+        assertTrue(generatedWhileValidationBlocked.get(), events.joinToString())
+        assertEquals(listOf("first", "second"), fake.generatedTexts)
+        assertTrue(result.manifest.chunks.all { it.validationPassed == true })
+    }
+
+    @Test
+    fun queuedValidationRetriesOnlyFailedChunksAfterTheProductionRound() {
+        val root = Files.createTempDirectory("batch-queued-validation-retry")
+        val attempts = mutableMapOf<Int, Int>()
+        val fake = RecordingBatchEngine()
+        val validator = BatchChunkValidator { _, index ->
+            val attempt = (attempts[index] ?: 0) + 1
+            attempts[index] = attempt
+            val passed = index != 0 || attempt > 1
+            BatchChunkValidationResult(
+                chunkIndex = index,
+                passed = passed,
+                message = if (passed) "passed" else "queued mismatch",
+                deterministic = BatchValidationReport(emptyList())
+            )
+        }
+        val request = BatchGenerationRequest(
+            batchId = "queued-validation-retry",
+            modelDir = root.toString(),
+            modelName = null,
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("first", "second", "third"),
+            languageId = 2050,
+            instruction = null,
+            speaker = null,
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(
+            request,
+            incrementalValidation = BatchIncrementalValidationPolicy(
+                validator = validator,
+                maxRetries = 1,
+                mode = BatchValidationMode.QUEUED
+            )
+        )
+
+        assertEquals(BatchGenerationStatus.COMPLETED, result.status)
+        assertEquals(mapOf(0 to 2, 1 to 1, 2 to 1), attempts)
+        assertEquals(listOf("first", "second", "third", "first"), fake.generatedTexts)
+        assertTrue(result.manifest.chunks.all { it.validationPassed == true })
+    }
+
+    @Test
+    fun queuedValidationFailsClosedWhenTheChunkChangesBeforeAsrPublishes() {
+        val root = Files.createTempDirectory("batch-queued-validation-stale")
+        val fake = RecordingBatchEngine()
+        val validator = BatchChunkValidator { _, index ->
+            BatchAudioStore(root).updateManifest { current ->
+                current.withChunk(current.chunks.single { it.index == index }.copy(
+                    text = "replacement text",
+                    status = BatchChunkStatus.PENDING,
+                    sampleRate = null,
+                    frameCount = null,
+                    sha256 = null,
+                    validationPassed = null,
+                    validationMessage = null,
+                    validationSignature = null
+                ))
+            }
+            BatchChunkValidationResult(
+                chunkIndex = index,
+                passed = true,
+                message = "validator result is now stale",
+                deterministic = BatchValidationReport(emptyList())
+            )
+        }
+        val request = BatchGenerationRequest(
+            batchId = "queued-validation-stale",
+            modelDir = root.toString(),
+            modelName = null,
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf("original text"),
+            languageId = 2050,
+            instruction = null,
+            speaker = null,
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(
+            request,
+            incrementalValidation = BatchIncrementalValidationPolicy(
+                validator = validator,
+                maxRetries = 1,
+                mode = BatchValidationMode.QUEUED
+            )
+        )
+
+        assertEquals(BatchGenerationStatus.FAILED, result.status)
+        assertTrue(result.error.orEmpty().contains("Manifest changed while queued validation"))
+        assertEquals("replacement text", result.manifest.chunks.single().text)
+        assertEquals(null, result.manifest.chunks.single().validationPassed)
+    }
+
+    @Test
     fun cancellationRequestedAfterFinalChunkStillCompletesValidBatch() {
         val root = Files.createTempDirectory("batch-generation")
         val fake = RecordingBatchEngine()
@@ -99,6 +461,180 @@ class BatchGenerationTest {
 
         assertEquals(BatchGenerationStatus.COMPLETED, result.status)
         assertEquals(BatchChunkStatus.COMPLETE, result.manifest.chunks.single().status)
+    }
+
+    @Test
+    fun nearCeilingChunkRetriesInSentenceOrderWithinAggregateBudget() {
+        val root = Files.createTempDirectory("batch-generation-retry-safe")
+        val text = "A".repeat(614) + ". " + "B".repeat(614) + "."
+        var calls = 0
+        val fake = RecordingBatchEngine(
+            resultFor = { partText, _ ->
+                calls++
+                val samples = if (calls == 1) {
+                    (BatchMemoryPolicy.maxAudioSamples(text) * 96L / 100L).toInt()
+                } else {
+                    BatchMemoryPolicy.maxAudioTokens(partText) * 1_920 / 2
+                }
+                QwenEngine.NativeResult(floatArrayOf().copyOf(samples), 24_000, true, null, 1L)
+            }
+        )
+        val request = BatchGenerationRequest(
+            batchId = "retry-safe",
+            modelDir = root.toString(),
+            modelName = "model.gguf",
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf(text),
+            languageId = 2050,
+            instruction = null,
+            speaker = "speaker-1",
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(request)
+
+        assertEquals(BatchGenerationStatus.COMPLETED, result.status)
+        assertEquals(1, fake.loadCalls)
+        assertEquals(3, fake.generatedTexts.size)
+        assertEquals(text, fake.generatedTexts.first())
+        assertEquals(listOf(615, 615), fake.generatedTexts.drop(1).map { it.length })
+        assertTrue(fake.generatedTexts[1].startsWith("A"))
+        assertTrue(fake.generatedTexts[2].startsWith("B"))
+        assertTrue(result.manifest.chunks.single().frameCount!! < BatchMemoryPolicy.maxAudioSamples(text))
+    }
+
+    @Test
+    fun nearCeilingRetryFailsWhenPiecesExceedOriginalAggregateBudget() {
+        val root = Files.createTempDirectory("batch-generation-retry-overflow")
+        val text = "A".repeat(614) + ". " + "B".repeat(614) + "."
+        var calls = 0
+        val fake = RecordingBatchEngine(
+            resultFor = { partText, _ ->
+                calls++
+                val samples = if (calls == 1) {
+                    (BatchMemoryPolicy.maxAudioSamples(text) * 96L / 100L).toInt()
+                } else {
+                    // Each retry piece is just below its own independent cap.
+                    // The aggregate of those independent caps is above the
+                    // original chunk budget, which the old implementation
+                    // accepted after concatenation.
+                    BatchMemoryPolicy.maxAudioTokens(partText) * 1_920 - 1
+                }
+                QwenEngine.NativeResult(floatArrayOf().copyOf(samples), 24_000, true, null, 1L)
+            }
+        )
+        val request = BatchGenerationRequest(
+            batchId = "retry-overflow",
+            modelDir = root.toString(),
+            modelName = "model.gguf",
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf(text),
+            languageId = 2050,
+            instruction = null,
+            speaker = "speaker-1",
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(request)
+
+        assertEquals(BatchGenerationStatus.FAILED, result.status)
+        assertEquals(BatchChunkStatus.FAILED, result.manifest.chunks.single().status)
+        assertTrue(result.error.orEmpty().contains("allocated audio budget"))
+        assertEquals(3, fake.generatedTexts.size)
+        assertTrue(
+            fake.generatedAudioSamples[1] < BatchMemoryPolicy.maxAudioSamples(fake.generatedTexts[1])
+        )
+        assertTrue(
+            fake.generatedAudioSamples[2] < BatchMemoryPolicy.maxAudioSamples(fake.generatedTexts[2])
+        )
+        assertTrue(!Files.exists(root.resolve("chunk-000000.wav")))
+    }
+
+    @Test
+    fun freshAdaptiveRechunkSplitsContextLimitedTextBeforeNativeWork() {
+        val root = Files.createTempDirectory("batch-generation-adaptive-rechunk")
+        val source = "word ".repeat(240)
+        val fake = RecordingBatchEngine(
+            textTokenCountFor = { text -> text.length * 5 }
+        )
+        val request = BatchGenerationRequest(
+            batchId = "adaptive-rechunk",
+            modelDir = root.toString(),
+            modelName = "qwen-talker-customvoice.gguf",
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf(source),
+            languageId = 2050,
+            instruction = "Calm narrator",
+            speaker = "Vivian",
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root,
+            preserveChunkBoundaries = true,
+            allowAdaptiveRechunking = true,
+            chunkVoices = mapOf(
+                0 to BatchVoiceParameters(
+                    name = "Vivian",
+                    modelName = "qwen-talker-customvoice.gguf",
+                    voicePrompt = "Calm narrator",
+                    speaker = "Vivian"
+                )
+            )
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(request)
+        val chunks = result.manifest.chunks.sortedBy { it.index }
+
+        assertEquals(BatchGenerationStatus.COMPLETED, result.status)
+        assertTrue(chunks.size > 1)
+        assertEquals(source, chunks.joinToString(separator = "") { it.text })
+        assertEquals("1", result.manifest.metadata["adaptiveAudioReplanVersion"])
+        assertTrue(chunks.all { it.voiceName == "Vivian" })
+        assertEquals(chunks.map { TextBatching.cleanForSynthesis(it.text) }, fake.generatedTexts)
+    }
+
+    @Test
+    fun adaptiveRechunkRefusesExistingChunkArtifactsWithoutMutatingDirectory() {
+        val root = Files.createTempDirectory("batch-generation-adaptive-existing-artifact")
+        val artifact = root.resolve("chunk-000000.txt")
+        Files.writeString(artifact, "existing artifact")
+        val source = "word ".repeat(240)
+        val fake = RecordingBatchEngine(
+            textTokenCountFor = { text -> text.length * 5 }
+        )
+        val request = BatchGenerationRequest(
+            batchId = "adaptive-existing-artifact",
+            modelDir = root.toString(),
+            modelName = "qwen-talker-customvoice.gguf",
+            backendPreference = NativeBackendPreference.Cpu,
+            texts = listOf(source),
+            languageId = 2050,
+            instruction = "Calm narrator",
+            speaker = "Vivian",
+            speakerEmbeddingPath = null,
+            iclPromptPath = null,
+            outputDirectory = root,
+            allowAdaptiveRechunking = true,
+            chunkVoices = mapOf(
+                0 to BatchVoiceParameters(
+                    name = "Vivian",
+                    modelName = "qwen-talker-customvoice.gguf",
+                    voicePrompt = "Calm narrator",
+                    speaker = "Vivian"
+                )
+            )
+        )
+
+        val result = BatchGenerationSession(fake, BatchAudioStore(root)).run(request)
+
+        assertEquals(BatchGenerationStatus.FAILED, result.status)
+        assertTrue(result.error.orEmpty().contains("fresh output directory"))
+        assertTrue(fake.generatedTexts.isEmpty())
+        assertEquals("existing artifact", Files.readString(artifact))
+        assertFalse(Files.exists(root.resolve("manifest.json")))
     }
 
     @Test
@@ -741,7 +1277,7 @@ class BatchGenerationTest {
         val secondGenerationStarted = CountDownLatch(1)
         val overlapObserved = java.util.concurrent.atomic.AtomicBoolean(false)
         val writeIndexes = java.util.Collections.synchronizedList(mutableListOf<Int>())
-        val fake = RecordingBatchEngine { text ->
+        val fake = RecordingBatchEngine(onGenerate = { text ->
             if (text == "second") {
                 if (writeStarted.await(1, TimeUnit.SECONDS)) {
                     overlapObserved.set(writeInFlight.get())
@@ -749,7 +1285,7 @@ class BatchGenerationTest {
                     releaseWrite.countDown()
                 }
             }
-        }
+        })
         val request = BatchGenerationRequest(
             batchId = "pipeline",
             modelDir = root.toString(),
@@ -889,11 +1425,24 @@ class BatchGenerationTest {
     }
 
     private class RecordingBatchEngine(
-        private val onGenerate: (String) -> Unit = {}
+        private val onGenerate: (String) -> Unit = {},
+        private val resultFor: (String, Int) -> QwenEngine.NativeResult = { _, _ ->
+            QwenEngine.NativeResult(
+                audio = floatArrayOf(0f, 0.1f),
+                sampleRate = 24_000,
+                success = true,
+                errorMsg = null,
+                timeMs = 1L
+            )
+        },
+        private val textTokenCountFor: ((String) -> Int)? = null
     ) : BatchEngine {
         var loadCalls = 0
+        var runtime: QwenEngine.NativeRuntimeIdentity? = null
         var memory: QwenEngine.BackendMemory? = null
         val generatedTexts = mutableListOf<String>()
+        val requestedMaxAudioTokens = mutableListOf<Int>()
+        val generatedAudioSamples = mutableListOf<Int>()
         val embeddingPaths = mutableListOf<String?>()
         val instructions = mutableListOf<String?>()
         var loadResult = QwenEngine.NativeOperationResult(success = true)
@@ -909,6 +1458,10 @@ class BatchGenerationTest {
 
         override fun backendMemory() = memory
 
+        override fun runtimeIdentity() = runtime
+
+        override fun textTokenCount(text: String): Int = textTokenCountFor?.invoke(text) ?: -1
+
         override fun generateDetailed(
             text: String,
             speakerEmbeddingPath: String?,
@@ -919,16 +1472,13 @@ class BatchGenerationTest {
             maxAudioTokens: Int
         ): QwenEngine.NativeResult {
             generatedTexts += text
+            requestedMaxAudioTokens += maxAudioTokens
             embeddingPaths += speakerEmbeddingPath
             instructions += instruction
             onGenerate(text)
-            return QwenEngine.NativeResult(
-                audio = floatArrayOf(0f, 0.1f),
-                sampleRate = 24_000,
-                success = true,
-                errorMsg = null,
-                timeMs = 1L
-            )
+            return resultFor(text, maxAudioTokens).also { result ->
+                generatedAudioSamples += result.audio?.size ?: 0
+            }
         }
     }
 

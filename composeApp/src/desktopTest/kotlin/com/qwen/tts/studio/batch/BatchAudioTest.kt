@@ -1,10 +1,14 @@
 package com.qwen.tts.studio.batch
 
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 
 class BatchAudioTest {
     @Test
@@ -70,6 +74,20 @@ class BatchAudioTest {
         assertEquals("Hello, \"world\"\nsecond line", Files.readString(root.resolve("chunk-000000.txt")))
         kotlin.test.assertTrue(json.contains("\\\"world\\\""))
         kotlin.test.assertTrue(json.contains("second line"))
+    }
+
+    @Test
+    fun legacyManifestWithoutDisplayIndexDefaultsToNumericLabel() {
+        val root = Files.createTempDirectory("batch-legacy-display-index")
+        val store = BatchAudioStore(root)
+        Files.writeString(
+            root.resolve("legacy.json"),
+            """{"batchId":"legacy","expectedChunkCount":1,"metadata":{},"chunks":[{"index":0,"fileName":"chunk-000000.wav","text":"legacy","status":"PENDING"}]}"""
+        )
+
+        val loaded = store.loadManifest(root.resolve("legacy.json"))
+
+        assertEquals("0", loaded.chunks.single().displayIndex)
     }
 
     @Test
@@ -142,6 +160,133 @@ class BatchAudioTest {
     }
 
     @Test
+    fun staleManifestRevisionCannotOverwriteAnotherStoreUpdate() {
+        val root = Files.createTempDirectory("batch-manifest-cas")
+        val first = BatchAudioStore(root)
+        val second = BatchAudioStore(root)
+        first.createManifest("manifest-cas", 1)
+        val stale = first.loadManifest()
+
+        second.updateManifest { current ->
+            current.copy(metadata = current.metadata + ("winner" to "second-store"))
+        }
+
+        assertFailsWith<BatchManifestConflictException> {
+            first.persistManifest(stale.copy(metadata = stale.metadata + ("winner" to "stale-store")))
+        }
+        assertEquals("second-store", first.loadManifest().metadata["winner"])
+    }
+
+    @Test
+    fun separateStoreInstancesMergeConcurrentChunkUpdatesWithoutLostRows() {
+        val root = Files.createTempDirectory("batch-manifest-lock")
+        val first = BatchAudioStore(root)
+        val second = BatchAudioStore(root)
+        first.createManifest("manifest-lock", 2)
+        first.updateManifest { current ->
+            current.withChunk(BatchChunk(0, "chunk-000000.wav", "first"))
+                .withChunk(BatchChunk(1, "chunk-000001.wav", "second"))
+        }
+        val start = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val futures = listOf(
+                executor.submit {
+                    start.await(2, TimeUnit.SECONDS)
+                    first.updateManifest { current ->
+                        current.withChunk(current.chunks.single { it.index == 0 }.copy(
+                            status = BatchChunkStatus.FAILED,
+                            error = "first-store"
+                        ))
+                    }
+                },
+                executor.submit {
+                    start.await(2, TimeUnit.SECONDS)
+                    second.updateManifest { current ->
+                        current.withChunk(current.chunks.single { it.index == 1 }.copy(
+                            status = BatchChunkStatus.FAILED,
+                            error = "second-store"
+                        ))
+                    }
+                }
+            )
+            start.countDown()
+            futures.forEach { it.get(5, TimeUnit.SECONDS) }
+        } finally {
+            executor.shutdownNow()
+        }
+
+        val merged = first.loadManifest()
+        assertEquals("first-store", merged.chunks.single { it.index == 0 }.error)
+        assertEquals("second-store", merged.chunks.single { it.index == 1 }.error)
+    }
+
+    @Test
+    fun validationLeaseRejectsReplacementThatReusesAnIntegerIndex() {
+        val root = Files.createTempDirectory("batch-validation-lease")
+        val store = BatchAudioStore(root)
+        val complete = store.writeChunk(
+            store.createManifest("validation-lease", 1),
+            0,
+            GeneratedAudio(floatArrayOf(0f, 0.1f), 24_000),
+            "original"
+        )
+        val lease = store.captureBatchChunkValidationLease(0)
+        store.updateManifest { current ->
+            current.withChunk(current.chunks.single().copy(
+                text = "replacement",
+                status = BatchChunkStatus.PENDING,
+                sampleRate = null,
+                frameCount = null,
+                sha256 = null,
+                validationPassed = null,
+                validationMessage = null,
+                validationSignature = null
+            ))
+        }
+
+        assertFailsWith<BatchManifestConflictException> {
+            store.persistChunkValidation(0, passed = true, message = "stale pass", expectedLease = lease)
+        }
+        val current = store.loadManifest().chunks.single()
+        assertEquals("replacement", current.text)
+        assertEquals(BatchChunkStatus.PENDING, current.status)
+        assertEquals(null, current.validationPassed)
+        assertEquals(complete.chunks.single().sha256, Files.readAllBytes(root.resolve("chunk-000000.wav")).let { bytes ->
+            java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        })
+    }
+
+    @Test
+    fun staleCompletionCannotOverwriteRechunkedLogicalRow() {
+        val root = Files.createTempDirectory("batch-completion-lease")
+        val store = BatchAudioStore(root)
+        val generated = store.writeChunk(
+            store.createManifest("completion-lease", 1),
+            0,
+            GeneratedAudio(floatArrayOf(0f), 24_000),
+            "old text"
+        ).chunks.single()
+        store.updateManifest { current ->
+            current.withChunk(current.chunks.single().copy(
+                text = "new text",
+                status = BatchChunkStatus.PENDING,
+                sampleRate = null,
+                frameCount = null,
+                sha256 = null,
+                validationPassed = null,
+                validationMessage = null,
+                validationSignature = null
+            ))
+        }
+
+        assertFailsWith<BatchManifestConflictException> {
+            store.persistCompletedChunk(generated)
+        }
+        assertEquals("new text", store.loadManifest().chunks.single().text)
+    }
+
+    @Test
     fun manifestRetainsPerChunkVoiceModelAndPromptAcrossWriteAndReload() {
         val root = Files.createTempDirectory("batch-config-reload")
         val store = BatchAudioStore(root)
@@ -156,16 +301,21 @@ class BatchAudioTest {
             )
         )
         val written = store.writeChunk(configured, 0, GeneratedAudio(floatArrayOf(0f), 24_000), "configured text")
+        val validated = store.persistChunkValidation(0, true, "Deterministic and ASR validation passed.")
         val loaded = store.loadManifest()
 
         assertEquals(written.chunks.single().voiceName, loaded.chunks.single().voiceName)
         assertEquals(written.chunks.single().modelName, loaded.chunks.single().modelName)
         assertEquals(written.chunks.single().voicePrompt, loaded.chunks.single().voicePrompt)
+        assertEquals(true, validated.chunks.single().validationPassed)
 
         val resumed = store.createOrResumeManifest("new-ui-run", listOf("configured text"))
         assertEquals("Ryan", resumed.chunks.single().voiceName)
         assertEquals("qwen-talker-1.7b-customvoice-Q8_0.gguf", resumed.chunks.single().modelName)
         assertEquals("Warm, measured delivery", resumed.chunks.single().voicePrompt)
+        assertEquals(true, resumed.chunks.single().validationPassed)
+        assertEquals("Deterministic and ASR validation passed.", resumed.chunks.single().validationMessage)
+        assertEquals(validated.chunks.single().validationSignature, resumed.chunks.single().validationSignature)
     }
 
     @Test
@@ -386,5 +536,99 @@ class BatchAudioTest {
         assertFailsWith<IllegalArgumentException> {
             store.recombine(manifest, root.resolve("chunk-000000.wav"))
         }
+    }
+
+    @Test
+    fun rechunksFailedSourceInPlaceWithDecimalLogicalIndexesAndPreservesCompleteAudio() {
+        val root = Files.createTempDirectory("batch-rechunk")
+        val store = BatchAudioStore(root)
+        val failedText = "Failed chunk sentence one. Failed chunk sentence two. Failed chunk sentence three."
+        val metadata = mapOf(
+            "textFingerprint" to "old-fingerprint",
+            "audioCapTokens.0" to "101",
+            "audioCapTokens.1" to "102",
+            "audioCapTokens.2" to "103"
+        )
+        var manifest = store.createManifest("rechunk", 3, metadata)
+        manifest = store.writeChunk(manifest, 0, GeneratedAudio(floatArrayOf(-0.1f), 24_000), "keep zero")
+        manifest = store.writeChunk(manifest, 1, GeneratedAudio(floatArrayOf(0.1f), 24_000), failedText)
+        manifest = store.writeChunk(manifest, 2, GeneratedAudio(floatArrayOf(0.2f), 24_000), "keep two")
+        val zeroSha = manifest.chunks.first { it.index == 0 }.sha256
+        manifest = store.markFailed(manifest, 1, "ASR suffix mismatch")
+
+        val result = store.rechunkFailedChunks(manifest, maxCharacters = 20)
+        val updated = result.manifest
+        val reloaded = store.loadManifest()
+
+        assertTrue(Files.isRegularFile(result.backupManifest))
+        assertEquals(3, store.loadManifest(result.backupManifest).expectedChunkCount)
+        assertTrue(updated.expectedChunkCount > 3)
+        assertEquals(updated, reloaded)
+        assertEquals("0", updated.chunks.first().displayIndex)
+        assertEquals("2", updated.chunks.last().displayIndex)
+        assertTrue(updated.chunks.drop(1).dropLast(1).all { it.displayIndex.startsWith("1.") })
+        assertTrue(updated.chunks.drop(1).dropLast(1).all { it.status == BatchChunkStatus.FAILED || it.status == BatchChunkStatus.PENDING })
+        assertEquals(zeroSha, updated.chunks.first { it.displayIndex == "0" }.sha256)
+        assertEquals(BatchChunkStatus.COMPLETE, updated.chunks.first { it.displayIndex == "0" }.status)
+        assertEquals(BatchChunkStatus.COMPLETE, updated.chunks.first { it.displayIndex == "2" }.status)
+        assertEquals(null, updated.metadata["audioCapTokens.1"])
+        assertEquals("101", updated.metadata["audioCapTokens.0"])
+        val tailIndex = updated.chunks.first { it.displayIndex == "2" }.index
+        assertEquals("103", updated.metadata["audioCapTokens.$tailIndex"])
+        assertEquals(
+            manifest.chunks.sortedBy { it.index }.joinToString("") { it.text },
+            updated.chunks.sortedBy { it.index }.joinToString("") { it.text }
+        )
+        assertTrue(Files.list(root).use { stream -> stream.toList().none { it.fileName.toString().startsWith(".rechunk-staging-") } })
+        assertTrue(Files.readString(root.resolve("manifest.json")).contains("\"displayIndex\":\"1.1\""))
+    }
+
+    @Test
+    fun retainsShortFailedSourceAsSingleRetryChild() {
+        val root = Files.createTempDirectory("batch-rechunk-short")
+        val store = BatchAudioStore(root)
+        var manifest = store.createManifest(
+            "rechunk-short",
+            1,
+            mapOf("audioCapTokens.0" to "101")
+        )
+        val shortText = "Short failed text."
+        manifest = store.markFailed(manifest, 0, "ASR mismatch", shortText)
+
+        val result = store.rechunkFailedChunks(manifest, maxCharacters = 40)
+        val retry = result.manifest.chunks.single()
+
+        assertTrue(Files.isRegularFile(result.backupManifest))
+        assertEquals(1, result.manifest.expectedChunkCount)
+        assertEquals("0.1", retry.displayIndex)
+        assertEquals(shortText, retry.text)
+        assertEquals(BatchChunkStatus.PENDING, retry.status)
+        assertEquals(null, result.manifest.metadata["audioCapTokens.0"])
+    }
+
+    @Test
+    fun mergesShortFailedTailWithAdjacentSpeechBeforeRetry() {
+        val root = Files.createTempDirectory("batch-rechunk-merge-short")
+        val store = BatchAudioStore(root)
+        val precedingText = "前".repeat(30)
+        val tailText = "截。"
+        var manifest = store.createManifest("rechunk-merge-short", 2)
+        manifest = store.writeChunk(
+            manifest,
+            0,
+            GeneratedAudio(floatArrayOf(0.1f), 24_000),
+            precedingText
+        )
+        manifest = store.markFailed(manifest, 1, "ASR mismatch", tailText)
+
+        val result = store.rechunkFailedChunks(manifest, maxCharacters = 40)
+        val retry = result.manifest.chunks.single()
+
+        assertEquals(1, result.manifest.expectedChunkCount)
+        assertEquals("0.1", retry.displayIndex)
+        assertEquals(precedingText + tailText, retry.text)
+        assertEquals(BatchChunkStatus.PENDING, retry.status)
+        assertEquals(listOf(0), result.sourceToNewIndexes[0])
+        assertEquals(listOf(0), result.sourceToNewIndexes[1])
     }
 }

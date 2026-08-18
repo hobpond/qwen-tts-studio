@@ -1,8 +1,9 @@
 package com.qwen.tts.studio.batch
 
 import com.qwen.tts.studio.engine.NativeBackendPreference
+import com.qwen.tts.studio.engine.QwenEngine
 import java.io.File
-import java.nio.file.Files
+import java.io.FileInputStream
 import java.security.MessageDigest
 
 enum class BatchVoiceMode(val id: String) {
@@ -106,10 +107,66 @@ object BatchIdentity {
         return data
     }
 
-    fun isCompatible(manifest: BatchManifest?, identity: BatchIdentityData, expectedChunkCount: Int): Boolean =
+    fun isCompatible(
+        manifest: BatchManifest?,
+        identity: BatchIdentityData,
+        expectedChunkCount: Int,
+        additionalMetadata: Map<String, String> = emptyMap()
+    ): Boolean =
         manifest != null &&
             manifest.expectedChunkCount == expectedChunkCount &&
-            identity.metadata().all { (key, value) -> manifest.metadata[key] == value }
+            (identity.metadata() + additionalMetadata).all { (key, value) -> manifest.metadata[key] == value }
+
+    /** Fingerprints the exact model file selected by a native batch request. */
+    fun modelArtifactMetadata(modelDir: String, modelName: String?): Map<String, String> =
+        fileArtifactMetadata("modelFile", resolveModelFile(modelDir, modelName))
+
+    /** Fingerprints an ASR or other auxiliary model after it is selected. */
+    fun auxiliaryArtifactMetadata(prefix: String, file: File): Map<String, String> =
+        fileArtifactMetadata(prefix, file)
+
+    /** Adds the loaded native DLL, dependencies, backend, and model capability identity. */
+    fun nativeRuntimeMetadata(
+        runtime: QwenEngine.NativeRuntimeIdentity,
+        capabilities: QwenEngine.NativeCapabilities?
+    ): Map<String, String> {
+        val metadata = linkedMapOf(
+            "manifestIdentityVersion" to "2",
+            "nativeRootPath" to runtime.rootPath,
+            "nativeLibraryName" to runtime.nativeLibrary.fileName,
+            "nativeLibraryPath" to runtime.nativeLibrary.absolutePath,
+            "nativeLibrarySizeBytes" to runtime.nativeLibrary.sizeBytes.toString(),
+            "nativeLibrarySha256" to runtime.nativeLibrary.sha256,
+            "nativeBackendName" to (runtime.activeBackendName ?: ""),
+            "nativeCompiledBackendMask" to runtime.compiledBackendMask.toString(),
+            "nativeRuntimeOs" to (System.getProperty("os.name") ?: "unknown"),
+            "nativeRuntimeArch" to (System.getProperty("os.arch") ?: "unknown"),
+            "appVersion" to (System.getenv("APP_VERSION")?.takeIf { it.isNotBlank() } ?: "1.0.0"),
+            "nativeDependencyCount" to runtime.dependencies.size.toString()
+        )
+        val allArtifacts = listOf(runtime.nativeLibrary) + runtime.dependencies
+        metadata["nativeRuntimeFingerprint"] = sha256Text(
+            allArtifacts.sortedWith(compareBy({ it.role }, { it.fileName }, { it.sha256 }))
+                .joinToString("\n") { "${it.role}|${it.fileName}|${it.sizeBytes}|${it.sha256}" }
+        )
+        runtime.dependencies.forEachIndexed { index, artifact ->
+            val prefix = "nativeDependency.$index."
+            metadata[prefix + "role"] = artifact.role
+            metadata[prefix + "name"] = artifact.fileName
+            metadata[prefix + "path"] = artifact.absolutePath
+            metadata[prefix + "sizeBytes"] = artifact.sizeBytes.toString()
+            metadata[prefix + "sha256"] = artifact.sha256
+        }
+        capabilities?.let { value ->
+            metadata["nativeModelKind"] = value.modelKind.toString()
+            metadata["nativeSpeakerEmbeddingDim"] = value.speakerEmbeddingDim.toString()
+            metadata["nativeSpeakerCount"] = value.speakerCount.toString()
+            metadata["nativeSupportsCloning"] = value.supportsCloning.toString()
+            metadata["nativeSupportsNamedSpeakers"] = value.supportsNamedSpeakers.toString()
+            metadata["nativeSupportsInstruction"] = value.supportsInstruction.toString()
+        }
+        return metadata
+    }
 
     /** Returns the durable app-managed location for captured voice artifacts. */
     fun durableVoiceArtifactDirectory(appDirectory: File? = null): File =
@@ -119,7 +176,16 @@ object BatchIdentity {
 
     fun sha256File(file: File): String {
         require(file.isFile) { "Artifact does not exist: ${file.absolutePath}" }
-        return sha256(Files.readAllBytes(file.toPath()))
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(1024 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                if (count > 0) digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     fun sha256FileOrNull(path: String?): String? = path
@@ -211,7 +277,7 @@ object BatchIdentity {
         ?.takeIf(String::isNotBlank)
         ?.let { File(it).absoluteFile.normalize().path }
 
-    private fun textFingerprint(texts: List<String>): String {
+    fun textFingerprint(texts: List<String>): String {
         val digest = MessageDigest.getInstance("SHA-256")
         texts.forEach { text ->
             digest.update(text.toByteArray(Charsets.UTF_8))
@@ -222,5 +288,37 @@ object BatchIdentity {
 
     private fun sha256(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+
+    private fun fileArtifactMetadata(prefix: String, file: File?): Map<String, String> {
+        val resolved = requireNotNull(file) {
+            "Cannot fingerprint the selected artifact: file was not resolved"
+        }
+        require(resolved.isFile) {
+            "Cannot fingerprint the selected artifact: ${resolved.absolutePath}"
+        }
+        val normalized = resolved.absoluteFile.normalize()
+        return linkedMapOf(
+            "${prefix}FingerprintAlgorithm" to "SHA-256",
+            "${prefix}Name" to normalized.name,
+            "${prefix}Path" to normalized.path,
+            "${prefix}SizeBytes" to normalized.length().toString(),
+            "${prefix}Sha256" to sha256File(normalized)
+        )
+    }
+
+    private fun resolveModelFile(modelDir: String, modelName: String?): File? {
+        val directory = File(modelDir).absoluteFile.normalize()
+        val requested = modelName?.trim().takeUnless { it.isNullOrEmpty() }
+        requested?.let { exact ->
+            File(directory, exact).takeIf { it.isFile }?.let { return it }
+        }
+        val candidates = directory.listFiles { file ->
+            file.isFile && file.extension.equals("gguf", ignoreCase = true) &&
+                (requested == null || file.name.startsWith(requested, ignoreCase = true))
+        }?.sortedBy { it.name.lowercase() }.orEmpty()
+        return candidates.singleOrNull()
+    }
+
+    private fun sha256Text(value: String): String = sha256(value.toByteArray(Charsets.UTF_8))
 
 }

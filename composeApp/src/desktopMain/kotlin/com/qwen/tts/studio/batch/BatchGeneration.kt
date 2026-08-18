@@ -8,6 +8,9 @@ import java.nio.file.Path
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Collections
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 
@@ -35,6 +38,9 @@ interface BatchEngine {
 
     fun backendMemory(): com.qwen.tts.studio.engine.QwenEngine.BackendMemory? = null
 
+    /** Fingerprint of the native distribution actually loaded by this engine. */
+    fun runtimeIdentity(): QwenEngine.NativeRuntimeIdentity? = null
+
     fun textTokenCount(text: String): Int = -1
 
     fun generateDetailed(
@@ -53,7 +59,8 @@ interface BatchEngine {
         iclPromptPath: String?,
         languageId: Int,
         instruction: String?,
-        speaker: String?
+        speaker: String?,
+        maxAudioTokens: Int
     ): BatchStreamingResult? = null
 }
 
@@ -74,6 +81,8 @@ class QwenBatchEngine(private val engine: QwenEngine) : BatchEngine {
     override fun availableSpeakers() = engine.getAvailableSpeakers()
 
     override fun backendMemory() = engine.backendMemory()
+
+    override fun runtimeIdentity() = engine.runtimeIdentity()
 
     override fun textTokenCount(text: String) = engine.textTokenCount(text)
 
@@ -101,7 +110,8 @@ class QwenBatchEngine(private val engine: QwenEngine) : BatchEngine {
         iclPromptPath: String?,
         languageId: Int,
         instruction: String?,
-        speaker: String?
+        speaker: String?,
+        maxAudioTokens: Int
     ): BatchStreamingResult? {
         val audio = ArrayList<FloatArray>()
         var sampleRate = 0
@@ -113,6 +123,7 @@ class QwenBatchEngine(private val engine: QwenEngine) : BatchEngine {
             languageId = languageId,
             instruction = instruction,
             speaker = speaker,
+            maxAudioTokens = maxAudioTokens,
             options = QwenEngine.StreamingOptions(chunkSeconds = 0.75f, leftContextSeconds = 2f, collectAudio = true)
         ) { chunk ->
             if (chunk.audio.isNotEmpty()) audio += chunk.audio
@@ -186,7 +197,9 @@ data class BatchGenerationRequest(
     val onlyIndices: Set<Int>? = null,
     val allowIncompatibleReplacement: Boolean = false,
     val defaultVoiceName: String? = null,
-    val chunkVoices: Map<Int, BatchVoiceParameters> = emptyMap()
+    val chunkVoices: Map<Int, BatchVoiceParameters> = emptyMap(),
+    /** Allows a fresh batch to split context-limited chunks before native work. */
+    val allowAdaptiveRechunking: Boolean = false
 ) {
     init {
         require(batchId.isNotBlank()) { "batchId must not be blank" }
@@ -217,6 +230,163 @@ data class BatchGenerationResult(
 )
 
 /**
+ * Enables per-chunk validation for a batch. [BatchValidationMode.BLOCKING]
+ * makes validation an admission barrier; [BatchValidationMode.QUEUED] keeps
+ * one ASR consumer behind the durable TTS producer. Validation owns no native
+ * engine here; callers supply a validator that can keep one ASR session loaded
+ * for the whole generation run.
+ */
+enum class BatchValidationMode { BLOCKING, QUEUED }
+
+data class BatchIncrementalValidationPolicy(
+    val validator: BatchChunkValidator,
+    val maxRetries: Int = 1,
+    val mode: BatchValidationMode = BatchValidationMode.BLOCKING,
+    val maxQueuedValidations: Int = 16,
+    val onChunkValidated: (BatchChunkValidationResult, BatchManifest) -> Unit = { _, _ -> }
+) {
+    init {
+        require(maxRetries >= 0) { "maxRetries must not be negative" }
+        require(maxQueuedValidations > 0) { "maxQueuedValidations must be positive" }
+    }
+}
+
+/**
+ * A single ASR consumer for durable chunks. The queue carries indexes, not
+ * audio buffers, so disk-backed batches can keep producing without retaining
+ * every WAV in memory. The producer experiences backpressure only when the
+ * bounded queue is full.
+ */
+private class QueuedBatchValidationWorker(
+    private val store: BatchAudioStore,
+    private val policy: BatchIncrementalValidationPolicy,
+    private val onManifest: (BatchManifest) -> Unit
+) : AutoCloseable {
+    private data class Task(
+        val index: Int,
+        val lease: BatchChunkValidationLease,
+        val result: CompletableFuture<BatchChunkValidationResult> = CompletableFuture(),
+        val poison: Boolean = false
+    )
+
+    private val queue = ArrayBlockingQueue<Task>(policy.maxQueuedValidations)
+    private val tasks = Collections.synchronizedList(mutableListOf<Task>())
+    private val worker = Thread({ runWorker() }, "batch-asr-validation-queue").apply {
+        isDaemon = true
+        start()
+    }
+    @Volatile
+    private var closed = false
+
+    fun enqueue(index: Int) {
+        check(!closed) { "Validation queue is closed." }
+        val lease = store.captureBatchChunkValidationLease(index)
+        val task = Task(index, lease)
+        tasks += task
+        try {
+            queue.put(task)
+        } catch (error: InterruptedException) {
+            tasks.remove(task)
+            Thread.currentThread().interrupt()
+            throw IllegalStateException("Interrupted while queueing validation for chunk $index", error)
+        }
+    }
+
+    fun awaitPhase(): List<BatchChunkValidationResult> {
+        val phaseTasks = synchronized(tasks) {
+            tasks.toList().also { tasks.clear() }
+        }
+        return phaseTasks.map { it.result.get() }
+    }
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        runCatching {
+            queue.put(Task(index = -1, lease = BatchChunkValidationLease(
+                index = -1,
+                fileName = "",
+                text = "",
+                displayIndex = "",
+                sampleRate = null,
+                frameCount = null,
+                sha256 = null,
+                generationSignature = ""
+            ), poison = true))
+            worker.join()
+        }
+    }
+
+    private fun runWorker() {
+        while (true) {
+            val task = try {
+                queue.take()
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+            if (task.poison) return
+            val result = validate(task)
+            task.result.complete(result)
+        }
+    }
+
+    private fun validate(task: Task): BatchChunkValidationResult {
+        val index = task.index
+        val manifest = runCatching { store.loadManifest() }.getOrElse { error ->
+            return failedResult(index, "Could not load the manifest for queued validation: ${failureMessage(error)}")
+        }
+        val validation = try {
+            policy.validator.validate(manifest, index)
+        } catch (error: Throwable) {
+            failedResult(index, "Queued validation failed: ${failureMessage(error)}")
+        }
+        return try {
+            val persisted = store.persistChunkValidation(index, validation.passed, validation.message, task.lease)
+            onManifest(persisted)
+            policy.onChunkValidated(validation, persisted)
+            validation
+        } catch (error: BatchManifestConflictException) {
+            val current = runCatching { store.loadManifest() }.getOrDefault(manifest)
+            val stale = failedResult(
+                index,
+                "Queued validation was discarded because chunk $index changed before publication: ${failureMessage(error)}",
+                validation,
+                stale = true
+            )
+            onManifest(current)
+            policy.onChunkValidated(stale, current)
+            stale
+        } catch (error: Throwable) {
+            val persistenceFailure = failedResult(
+                index,
+                "Could not persist queued validation: ${failureMessage(error)}",
+                validation
+            )
+            policy.onChunkValidated(persistenceFailure, manifest)
+            persistenceFailure
+        }
+    }
+
+    private fun failedResult(
+        index: Int,
+        message: String,
+        prior: BatchChunkValidationResult? = null,
+        stale: Boolean = false
+    ): BatchChunkValidationResult = BatchChunkValidationResult(
+        chunkIndex = index,
+        passed = false,
+        message = message,
+        deterministic = prior?.deterministic ?: BatchValidationReport(emptyList()),
+        asr = prior?.asr,
+        stale = stale
+    )
+
+    private fun failureMessage(error: Throwable): String =
+        error.message ?: error::class.simpleName ?: "unknown error"
+}
+
+/**
  * Runs buffered requests against one explicitly loaded native engine.
  * The engine is never loaded or released between chunk requests.
  */
@@ -233,13 +403,15 @@ class BatchGenerationSession(
         onChunkStarted: (index: Int) -> Unit = {},
         onChunkReady: (index: Int) -> Unit = {},
         onPersistenceStarted: (index: Int) -> Unit = {},
-        onPersistenceCompleted: (index: Int) -> Unit = {}
+        onPersistenceCompleted: (index: Int) -> Unit = {},
+        incrementalValidation: BatchIncrementalValidationPolicy? = null
     ): BatchGenerationResult {
         require(request.outputDirectory.toAbsolutePath().normalize() == store.directoryPath) {
             "Batch store directory must equal request output directory"
         }
 
         val requestIdentity = BatchIdentity.forRequest(request)
+        var runtimeProvenance = emptyMap<String, String>()
         val manifestPath = request.outputDirectory.toAbsolutePath().normalize().resolve("manifest.json")
         val manifestRead = if (Files.isRegularFile(manifestPath)) {
             runCatching { store.loadManifest() }
@@ -256,7 +428,7 @@ class BatchGenerationSession(
                 request.texts.mapIndexed { index, text ->
                     BatchChunk(index, "chunk-%06d.wav".format(index), text)
                 },
-                requestIdentity.metadata()
+                requestIdentity.metadata() + runtimeProvenance
             )
 
         fun preflightFailure(error: String?): BatchGenerationResult = BatchGenerationResult(
@@ -306,6 +478,28 @@ class BatchGenerationSession(
             )
         }
 
+        val loadedRuntimeIdentity = engine.runtimeIdentity()
+        if (loadedRuntimeIdentity != null) {
+            runtimeProvenance = runCatching {
+                BatchIdentity.modelArtifactMetadata(request.modelDir, request.modelName) +
+                    BatchIdentity.nativeRuntimeMetadata(loadedRuntimeIdentity, loadedCapabilities)
+            }.getOrElse { error ->
+                return preflightFailure("Could not fingerprint the loaded model/native runtime: ${error.message ?: "unknown error"}")
+            }
+            val fullPreviousCompatibility = BatchIdentity.isCompatible(
+                previousManifest,
+                requestIdentity,
+                request.texts.size,
+                runtimeProvenance
+            )
+            if (previousManifest != null && !fullPreviousCompatibility && !request.allowIncompatibleReplacement) {
+                return preflightFailure(
+                    "The output directory contains a batch generated with a different model or native runtime fingerprint. " +
+                        "Generate a fresh batch or explicitly allow replacement before starting."
+                )
+            }
+        }
+
         val memory = BatchMemoryPolicy.snapshot(engine.backendMemory())
         val memoryPlan = BatchMemoryPolicy.plan(memory)
         val maxCharacters = memoryPlan.maxCharacters
@@ -323,7 +517,7 @@ class BatchGenerationSession(
         val needsMeasuredRepack = !request.preserveChunkBoundaries && request.texts.any { text ->
             text.length > maxCharacters || (textTokenCounter?.invoke(text)?.let { it > 2_048 } == true)
         }
-        val texts = if (needsMeasuredRepack) {
+        val measuredTexts = if (needsMeasuredRepack) {
             TextBatching.packParagraphsMeasured(
                 request.texts.joinToString(separator = ""),
                 maxCharacters,
@@ -333,7 +527,57 @@ class BatchGenerationSession(
         } else {
             request.texts
         }
+
+        data class PlannedText(val text: String, val sourceIndex: Int)
+
+        val basePlan = measuredTexts.mapIndexed { index, text -> PlannedText(text, index) }
+        val canRechunkVoiceMap = request.chunkVoices.values.distinct().size <= 1
+        val adaptiveCandidate = if (
+            request.allowAdaptiveRechunking &&
+            request.onlyIndices == null &&
+            request.regenerateIndices.isEmpty() &&
+            canRechunkVoiceMap
+        ) {
+            basePlan.flatMap { planned ->
+                TextBatching.replanForAudioBudget(
+                    source = planned.text,
+                    customVoice = request.modelName?.contains("customvoice", ignoreCase = true) == true ||
+                        loadedCapabilities?.supportsNamedSpeakers == true,
+                    textTokenCount = textTokenCounter,
+                    instruction = request.instruction
+                ).map { text -> PlannedText(text, planned.sourceIndex) }
+            }
+        } else {
+            basePlan
+        }
+        val adaptiveChanged = adaptiveCandidate.size != basePlan.size ||
+            adaptiveCandidate.map { it.text } != basePlan.map { it.text }
+        val hasChunkArtifacts = Files.isDirectory(request.outputDirectory) && Files.list(request.outputDirectory).use { entries ->
+            entries.anyMatch { path ->
+                val name = path.fileName.toString()
+                Files.isRegularFile(path) && name.startsWith("chunk-") &&
+                    (name.endsWith(".wav") || name.endsWith(".txt"))
+            }
+        }
+        val adaptiveFresh = previousManifest == null && manifestFailure == null &&
+            request.onlyIndices == null && request.regenerateIndices.isEmpty() &&
+            canRechunkVoiceMap && !hasChunkArtifacts
+        if (adaptiveChanged && !adaptiveFresh) {
+            return preflightFailure(
+                "Adaptive audio re-chunking would change the existing batch plan. " +
+                    "Start it in a fresh output directory; existing manifests and chunk artifacts were left untouched."
+            )
+        }
+        val planned = if (adaptiveChanged) adaptiveCandidate else basePlan
+        val texts = planned.map { it.text }
         val generationTexts = texts.map(TextBatching::cleanForSynthesis)
+        val chunkVoices = if (adaptiveChanged) {
+            planned.mapIndexedNotNull { index, entry ->
+                request.chunkVoices[entry.sourceIndex]?.let { index to it }
+            }.toMap()
+        } else {
+            request.chunkVoices
+        }
         val selectedIndices = request.onlyIndices ?: texts.indices.toSet()
         if (request.preserveChunkBoundaries && previousCompatible) {
             val oversizedReplayIndices = selectedIndices.filter { index ->
@@ -349,15 +593,33 @@ class BatchGenerationSession(
             }
         }
         onStatus("Scanning existing chunk files...")
+        if (adaptiveChanged) {
+            onStatus("Adaptive audio replan: ${basePlan.size} source chunks became ${texts.size} safe chunks.")
+        }
         val resumableMetadata = BatchIdentity.forRequest(request.copy(texts = texts)).metadata() +
-            ("batchMaxCharacters" to maxCharacters.toString())
-        var manifest = store.createOrResumeManifest(request.batchId, texts, resumableMetadata)
+            runtimeProvenance +
+            ("batchMaxCharacters" to maxCharacters.toString()) +
+            if (adaptiveChanged) {
+                mapOf(
+                    "adaptiveAudioReplanVersion" to "1",
+                    "adaptiveAudioReplanSourceChunks" to basePlan.size.toString()
+                )
+            } else {
+                emptyMap()
+            }
+        var manifest = store.createOrResumeManifest(
+            request.batchId,
+            texts,
+            resumableMetadata,
+            allowUnreadableReplacement = request.allowIncompatibleReplacement
+        )
         onManifest(manifest)
         if (request.onlyIndices != null && previousManifest != null) {
             val previousCompatible = BatchIdentity.isCompatible(
                 previousManifest,
                 BatchIdentity.forRequest(request.copy(texts = texts)),
-                texts.size
+                texts.size,
+                runtimeProvenance
             )
             if (previousCompatible) {
                 var restored = false
@@ -372,7 +634,7 @@ class BatchGenerationSession(
                     }
                 }
                 if (restored) {
-                    store.persistManifest(manifest)
+                    manifest = store.persistManifest(manifest)
                     onManifest(manifest)
                 }
             }
@@ -402,15 +664,16 @@ class BatchGenerationSession(
                         error = limitError,
                         voiceName = existing?.voiceName,
                         modelName = existing?.modelName,
-                        voicePrompt = existing?.voicePrompt
+                        voicePrompt = existing?.voicePrompt,
+                        displayIndex = existing?.displayIndex ?: index.toString()
                     )
                 )
             }
             return try {
-                store.persistManifest(failed)
+                val persistedFailed = store.persistManifest(failed)
                 BatchGenerationResult(
                     BatchGenerationStatus.FAILED,
-                    failed,
+                    persistedFailed,
                     emptyList(),
                     "$limitError Chunks: ${oversizedIndices.joinToString()}.",
                     request.outputDirectory
@@ -430,67 +693,82 @@ class BatchGenerationSession(
             Thread(runnable, "batch-audio-persistence").apply { isDaemon = true }
         }
         var pendingWrite: PendingWrite? = null
+        val validationQueue = incrementalValidation
+            ?.takeIf { it.mode == BatchValidationMode.QUEUED }
+            ?.let { policy -> QueuedBatchValidationWorker(store, policy, onManifest) }
+        val queuedValidationAttempts = mutableMapOf<Int, Int>()
+
+        fun recordCompletedItem(index: Int, text: String, fileName: String) {
+            completed.removeAll { it.index == index }
+            completed += BatchItemResult(index, text, request.outputDirectory.resolve(fileName).toFile())
+            completed.sortBy { it.index }
+        }
 
         fun markFailure(index: Int, text: String, error: String): String {
-            val failed = manifest.withChunk(
-                BatchChunk(
-                    index = index,
-                    fileName = manifest.chunks.firstOrNull { it.index == index }?.fileName
-                        ?: "chunk-%06d.wav".format(index),
-                    text = text,
-                    status = BatchChunkStatus.FAILED,
-                    error = error,
-                    voiceName = manifest.chunks.firstOrNull { it.index == index }?.voiceName,
-                    modelName = manifest.chunks.firstOrNull { it.index == index }?.modelName,
-                    voicePrompt = manifest.chunks.firstOrNull { it.index == index }?.voicePrompt
-                )
-            )
-            manifest = failed
-            val persistenceFailure = runCatching { store.persistManifest(failed) }.exceptionOrNull()
+            val persistenceFailure = runCatching {
+                manifest = store.markFailed(manifest, index, error, text)
+            }.exceptionOrNull()
             onManifest(manifest)
             return if (persistenceFailure == null) error
             else "$error Manifest persistence failed: ${failureMessage(persistenceFailure)}"
+        }
+
+        fun persistAlignment(index: Int, text: String, chunk: BatchChunk, spans: List<BatchAlignmentSpan>?) {
+            spans?.let {
+                val sampleRate = chunk.sampleRate ?: 0
+                val duration = (chunk.frameCount ?: 0L).toFloat() / sampleRate.coerceAtLeast(1)
+                val alignment = BatchChunkAlignment(
+                    textSha256 = sha256Text(text),
+                    wavSha256 = chunk.sha256.orEmpty(),
+                    sampleRate = sampleRate,
+                    durationSeconds = duration,
+                    quality = "APPROXIMATE",
+                    method = "qwen-tts-streaming-estimated",
+                    spans = it
+                )
+                if (alignment.isValidFor(text, chunk.sha256.orEmpty(), duration)) {
+                    store.writeAlignment(index, alignment)
+                    BatchLog.error("[BatchAlignment] chunk=$index method=${alignment.method} quality=${alignment.quality} spans=${it.size} duration=${"%.3f".format(java.util.Locale.ROOT, duration)}")
+                } else {
+                    store.deleteAlignment(index)
+                    BatchLog.error("[BatchAlignment] chunk=$index rejected reason=guardrail spans=${it.size} duration=${"%.3f".format(java.util.Locale.ROOT, duration)}")
+                }
+            }
         }
 
         fun commitPendingWrite(): String? {
             val pending = pendingWrite ?: return null
             return try {
                 val chunk = pending.future.get()
-                val nextManifest = manifest.withChunk(chunk)
-                store.persistManifest(nextManifest)
-                pending.alignmentSpans?.let { spans ->
-                    val sampleRate = chunk.sampleRate ?: 0
-                    val duration = (chunk.frameCount ?: 0L).toFloat() / sampleRate.coerceAtLeast(1)
-                    val alignment = BatchChunkAlignment(
-                        textSha256 = sha256Text(pending.text),
-                        wavSha256 = chunk.sha256.orEmpty(),
-                        sampleRate = sampleRate,
-                        durationSeconds = duration,
-                        quality = "APPROXIMATE",
-                        method = "qwen-tts-streaming-estimated",
-                        spans = spans
-                    )
-                    if (alignment.isValidFor(pending.text, chunk.sha256.orEmpty(), duration)) {
-                        store.writeAlignment(pending.index, alignment)
-                        BatchLog.error("[BatchAlignment] chunk=${pending.index} method=${alignment.method} quality=${alignment.quality} spans=${spans.size} duration=${"%.3f".format(java.util.Locale.ROOT, duration)}")
-                    } else {
-                        store.deleteAlignment(pending.index)
-                        BatchLog.error("[BatchAlignment] chunk=${pending.index} rejected reason=guardrail spans=${spans.size} duration=${"%.3f".format(java.util.Locale.ROOT, duration)}")
-                    }
-                }
+                val nextManifest = store.persistCompletedChunk(chunk)
+                persistAlignment(pending.index, pending.text, chunk, pending.alignmentSpans)
                 manifest = nextManifest
                 onManifest(manifest)
-                completed += BatchItemResult(
-                    pending.index,
-                    pending.text,
-                    request.outputDirectory.resolve(chunk.fileName).toFile()
-                )
+                recordCompletedItem(pending.index, pending.text, chunk.fileName)
                 onProgress(completed.size, texts.size)
                 pendingWrite = null
                 null
             } catch (error: Throwable) {
                 pendingWrite = null
                 markFailure(pending.index, pending.text, failureMessage(error))
+            }
+        }
+
+        fun persistImmediately(index: Int, text: String, generated: GeneratedAudio, spans: List<BatchAlignmentSpan>?): BatchManifest {
+            onPersistenceStarted(index)
+            BatchLog.error("[BatchPersistence] start chunk=$index dir=${store.directoryPath}")
+            return try {
+                val written = store.writeChunkFile(manifest, index, generated, text)
+                val persisted = store.persistCompletedChunk(written)
+                persistAlignment(index, text, written, spans)
+                manifest = persisted
+                onManifest(manifest)
+                onPersistenceCompleted(index)
+                BatchLog.error("[BatchPersistence] complete chunk=$index file=${store.directoryPath.resolve(written.fileName)} manifest=${store.directoryPath.resolve("manifest.json")}")
+                manifest
+            } catch (error: Throwable) {
+                BatchLog.error("[BatchPersistence] failed chunk=$index dir=${store.directoryPath} error=${error.message ?: error::class.simpleName}")
+                throw error
             }
         }
 
@@ -501,19 +779,7 @@ class BatchGenerationSession(
                     // Cancellation must never downgrade a durable completion, even
                     // when the selected operation was a regeneration.
                     if (existing?.status == BatchChunkStatus.COMPLETE) return@forEach
-                    manifest = manifest.withChunk(
-                        BatchChunk(
-                            index = index,
-                            fileName = existing?.fileName ?: "chunk-%06d.wav".format(index),
-                            text = existing?.text ?: texts[index],
-                            status = BatchChunkStatus.CANCELLED,
-                            error = "Cancelled",
-                            voiceName = existing?.voiceName,
-                            modelName = existing?.modelName,
-                            voicePrompt = existing?.voicePrompt
-                        )
-                    )
-                    store.persistManifest(manifest)
+                    manifest = store.markCancelled(manifest, index)
                     onManifest(manifest)
                 }
                 null
@@ -543,20 +809,37 @@ class BatchGenerationSession(
         }
 
         try {
+            var workIndices: Set<Int> = selectedIndices
+            while (true) {
             for (index in texts.indices) {
-                if (index !in selectedIndices) continue
+                if (index !in workIndices) continue
                 val text = texts[index]
                 val existing = manifest.chunks.firstOrNull { it.index == index }
-                val requestedVoiceName = request.chunkVoices[index]?.name
-                if (existing?.status == BatchChunkStatus.COMPLETE && index !in request.regenerateIndices &&
+                val requestedVoiceName = chunkVoices[index]?.name
+                val existingValidationSatisfied = incrementalValidation == null || existing?.validationPassed == true
+                if (existing?.status == BatchChunkStatus.COMPLETE && existingValidationSatisfied && index !in request.regenerateIndices &&
                     (requestedVoiceName == null || (existing.voiceName == requestedVoiceName &&
-                        existing.modelName == request.chunkVoices[index]?.modelName &&
-                        existing.voicePrompt == request.chunkVoices[index]?.voicePrompt))
+                        existing.modelName == chunkVoices[index]?.modelName &&
+                        existing.voicePrompt == chunkVoices[index]?.voicePrompt))
                 ) {
                     commitPendingWrite()?.let { error ->
                         return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, error, request.outputDirectory)
                     }
-                    completed += BatchItemResult(index, text, request.outputDirectory.resolve(existing.fileName).toFile())
+                    recordCompletedItem(index, text, existing.fileName)
+                    onProgress(completed.size, texts.size)
+                    continue
+                }
+                val existingVoiceMatches = requestedVoiceName == null || (existing?.voiceName == requestedVoiceName &&
+                    existing.modelName == chunkVoices[index]?.modelName &&
+                    existing.voicePrompt == chunkVoices[index]?.voicePrompt)
+                if (validationQueue != null && existing?.status == BatchChunkStatus.COMPLETE &&
+                    existing.validationPassed != false && index !in request.regenerateIndices && existingVoiceMatches
+                ) {
+                    // A legacy or resumed COMPLETE chunk can enter the ASR
+                    // queue without being regenerated. Only a known failed
+                    // validation result forces new TTS audio.
+                    validationQueue.enqueue(index)
+                    recordCompletedItem(index, text, existing.fileName)
                     onProgress(completed.size, texts.size)
                     continue
                 }
@@ -567,11 +850,18 @@ class BatchGenerationSession(
                     return cancellationResult(index)
                 }
 
-                try {
-                    val voice = request.chunkVoices[index]
+                var validationAttempt = 0
+                while (true) {
+                    try {
+                    val voice = chunkVoices[index]
                     if (voice != null && (manifest.chunks.firstOrNull { it.index == index }?.voiceName != voice.name || manifest.chunks.firstOrNull { it.index == index }?.modelName != voice.modelName || manifest.chunks.firstOrNull { it.index == index }?.voicePrompt != voice.voicePrompt)) {
-                        manifest = manifest.withChunk(manifest.chunks.first { it.index == index }.copy(voiceName = voice.name, modelName = voice.modelName, voicePrompt = voice.voicePrompt))
-                        store.persistManifest(manifest)
+                        manifest = store.updateManifest { current ->
+                            current.withChunk(current.chunks.first { it.index == index }.copy(
+                                voiceName = voice.name,
+                                modelName = voice.modelName,
+                                voicePrompt = voice.voicePrompt
+                            ))
+                        }
                         onManifest(manifest)
                     }
                     val requestedModel = voice?.modelName ?: request.modelName
@@ -595,7 +885,23 @@ class BatchGenerationSession(
                     ) {
                         error("CustomVoice model requires a named speaker, reference, or speaker embedding; none was resolved for chunk $index.")
                     }
-                    var streamed = engine.generateStreaming(generationText, speakerEmbedding, iclPrompt, request.languageId, instruction, speaker)
+                    val isCustomVoice = requestedModel?.contains("customvoice", ignoreCase = true) == true ||
+                        loadedCapabilities?.supportsNamedSpeakers == true
+                    val maxAudioTokens = BatchMemoryPolicy.maxAudioTokens(
+                        generationText,
+                        customVoice = isCustomVoice,
+                        textTokenCount = textTokenCounter?.invoke(generationText),
+                        instruction = instruction
+                    )
+                    var streamed = engine.generateStreaming(
+                        generationText,
+                        speakerEmbedding,
+                        iclPrompt,
+                        request.languageId,
+                        instruction,
+                        speaker,
+                        maxAudioTokens
+                    )
                     var native = streamed?.let { QwenEngine.NativeResult(it.audio, it.sampleRate, true, null, 0L) }
                         ?: engine.generateDetailed(
                             text = generationText,
@@ -604,9 +910,14 @@ class BatchGenerationSession(
                             languageId = request.languageId,
                             instruction = instruction,
                             speaker = speaker,
-                            maxAudioTokens = BatchMemoryPolicy.maxAudioTokens(generationText)
+                            maxAudioTokens = maxAudioTokens
                         )
-                    val safeAudioSamples = BatchMemoryPolicy.maxAudioSamples(generationText)
+                    val safeAudioSamples = BatchMemoryPolicy.maxAudioSamples(
+                        generationText,
+                        customVoice = isCustomVoice,
+                        textTokenCount = textTokenCounter?.invoke(generationText),
+                        instruction = instruction
+                    )
                     // Native generation can stop just below the requested
                     // budget, before the token ceiling is reached. In long
                     // chunks that still presents as a clipped final sentence.
@@ -617,31 +928,49 @@ class BatchGenerationSession(
                         generationText.length >= 200
                     ) {
                         val split = splitForAudioRetry(generationText)
-                        if (split != null) {
-                            onStatus("Audio budget reached for chunk $index; retrying at a sentence boundary...")
-                            val parts = split.toList().map { part ->
-                                engine.generateDetailed(
-                                    text = part,
-                                    speakerEmbeddingPath = speakerEmbedding,
-                                    iclPromptPath = iclPrompt,
-                                    languageId = request.languageId,
-                                    instruction = instruction,
-                                    speaker = speaker,
-                                    maxAudioTokens = BatchMemoryPolicy.maxAudioTokens(part)
+                            ?: error(
+                                "Audio reached the retry threshold for chunk $index, but no sentence boundary was available; " +
+                                    "refusing to accept possible truncation."
+                            )
+                        onStatus("Audio budget reached for chunk $index; retrying at a sentence boundary...")
+                        val parts = split.toList().map(TextBatching::cleanForSynthesis)
+                        native = generateSentenceBoundaryRetry(
+                            original = native,
+                            parts = parts,
+                            aggregateAudioTokens = maxAudioTokens,
+                            aggregateAudioSamples = safeAudioSamples,
+                            partAudioTokens = { partText ->
+                                BatchMemoryPolicy.maxAudioTokens(
+                                    partText,
+                                    customVoice = isCustomVoice,
+                                    textTokenCount = textTokenCounter?.invoke(partText),
+                                    instruction = instruction
                                 )
                             }
-                            if (parts.all { it.success && it.audio?.isNotEmpty() == true && it.sampleRate == native.sampleRate }) {
-                                val samples = FloatArray(parts.sumOf { it.audio!!.size })
-                                var offset = 0
-                                parts.forEach { part -> part.audio!!.copyInto(samples, offset); offset += part.audio!!.size }
-                                native = QwenEngine.NativeResult(samples, native.sampleRate, true, null, native.timeMs)
-                                streamed = null
-                            }
+                        ) { partText, partMaxAudioTokens ->
+                            engine.generateDetailed(
+                                text = partText,
+                                speakerEmbeddingPath = speakerEmbedding,
+                                iclPromptPath = iclPrompt,
+                                languageId = request.languageId,
+                                instruction = instruction,
+                                speaker = speaker,
+                                maxAudioTokens = partMaxAudioTokens
+                            )
                         }
+                        streamed = null
                     }
                     val audio = native.audio?.takeIf { native.success && it.isNotEmpty() }
                     if (audio == null || native.sampleRate <= 0) {
                         val error = native.errorMsg ?: "Synthesis returned no audio."
+                        if (incrementalValidation != null) {
+                            // Route transient native failures through the same
+                            // serial retry gate as validation failures. The
+                            // chunk remains unadmitted and no next chunk is
+                            // generated until this attempt succeeds or the
+                            // retry budget is exhausted.
+                            throw IllegalStateException(error)
+                        }
                         commitPendingWrite()?.let { pendingError ->
                             val currentError = markFailure(index, text, error)
                             return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, "$pendingError; $currentError", request.outputDirectory)
@@ -650,43 +979,166 @@ class BatchGenerationSession(
                         return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, persistedError, request.outputDirectory)
                     }
 
-                    // Generate the next chunk while the previous chunk is written,
-                    // then commit the previous write before admitting this one.
                     val generated = GeneratedAudio(audio, native.sampleRate)
                     onChunkReady(index)
-                    commitPendingWrite()?.let { pendingError ->
-                        val currentError = markFailure(index, text, "Previous persistence failed: $pendingError")
-                        return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, "$pendingError; $currentError", request.outputDirectory)
-                    }
-                    val writeManifest = manifest
-                    val future = persistenceExecutor.submit<BatchChunk> {
-                        onPersistenceStarted(index)
-                        BatchLog.error("[BatchPersistence] start chunk=$index dir=${store.directoryPath}")
-                        try {
-                            store.writeChunkFile(writeManifest, index, generated, text).also { chunk ->
-                                // Persist completion as soon as the WAV and text sidecars are
-                                // durable. Do not wait for the next GPU generation to finish;
-                                // otherwise the manifest can report PENDING for minutes while
-                                // the completed chunk is already playable on disk.
-                                val persisted = store.persistCompletedChunk(chunk)
-                                onManifest(persisted)
-                                onPersistenceCompleted(index)
-                                BatchLog.error("[BatchPersistence] complete chunk=$index file=${store.directoryPath.resolve(chunk.fileName)} manifest=${store.directoryPath.resolve("manifest.json")}")
-                            }
-                        } catch (error: Throwable) {
-                            BatchLog.error("[BatchPersistence] failed chunk=$index dir=${store.directoryPath} error=${error.message ?: error::class.simpleName}")
-                            throw error
+                    // The normal path overlaps one native generation with the
+                    // previous disk write. Blocking validation uses an explicit
+                    // generate -> persist -> validate barrier; queued validation
+                    // persists immediately and lets its single ASR consumer
+                    // work behind the TTS producer.
+                    if (incrementalValidation == null) {
+                        commitPendingWrite()?.let { pendingError ->
+                            val currentError = markFailure(index, text, "Previous persistence failed: $pendingError")
+                            return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, "$pendingError; $currentError", request.outputDirectory)
                         }
                     }
-                    pendingWrite = PendingWrite(index, text, future, streamed?.spans)
+                    val capMetadataKey = BatchValidationMetadata.audioCapTokensKey(index)
+                    val capMetadataValue = maxAudioTokens.toString()
+                    if (manifest.metadata[capMetadataKey] != capMetadataValue) {
+                        manifest = store.updateManifest { current ->
+                            current.copy(metadata = current.metadata + (capMetadataKey to capMetadataValue))
+                        }
+                        onManifest(manifest)
+                    }
+                    if (incrementalValidation == null) {
+                        val writeManifest = manifest
+                        val future = persistenceExecutor.submit<BatchChunk> {
+                            onPersistenceStarted(index)
+                            BatchLog.error("[BatchPersistence] start chunk=$index dir=${store.directoryPath}")
+                            try {
+                                store.writeChunkFile(writeManifest, index, generated, text).also { chunk ->
+                                    // Persist completion as soon as the WAV and text sidecars are
+                                    // durable. Do not wait for the next GPU generation to finish;
+                                    // otherwise the manifest can report PENDING for minutes while
+                                    // the completed chunk is already playable on disk.
+                                    val persisted = store.persistCompletedChunk(chunk)
+                                    onManifest(persisted)
+                                    onPersistenceCompleted(index)
+                                    BatchLog.error("[BatchPersistence] complete chunk=$index file=${store.directoryPath.resolve(chunk.fileName)} manifest=${store.directoryPath.resolve("manifest.json")}")
+                                }
+                            } catch (error: Throwable) {
+                                BatchLog.error("[BatchPersistence] failed chunk=$index dir=${store.directoryPath} error=${error.message ?: error::class.simpleName}")
+                                throw error
+                            }
+                        }
+                        pendingWrite = PendingWrite(index, text, future, streamed?.spans)
+                        break
+                    }
+
+                    persistImmediately(index, text, generated, streamed?.spans)
+                    if (validationQueue != null) {
+                        // Validation runs as a consumer of the durable WAV;
+                        // TTS proceeds immediately unless the bounded queue
+                        // is full. Retry decisions are collected after this
+                        // production phase, so ASR never blocks every chunk.
+                        validationQueue.enqueue(index)
+                        recordCompletedItem(index, text, manifest.chunks.first { it.index == index }.fileName)
+                        onProgress(completed.size, texts.size)
+                        break
+                    }
+                    val validationLease = store.captureBatchChunkValidationLease(index)
+                    val validationManifest = store.loadManifest()
+                    val validation = incrementalValidation.validator.validate(validationManifest, index)
+                    val validatedManifest = store.persistChunkValidation(
+                        index,
+                        validation.passed,
+                        validation.message,
+                        validationLease
+                    )
+                    manifest = validatedManifest
+                    onManifest(manifest)
+                    incrementalValidation.onChunkValidated(validation, manifest)
+                    if (!validation.passed) {
+                        if (validationAttempt < incrementalValidation.maxRetries) {
+                            validationAttempt++
+                            onStatus("Chunk ${index + 1} failed validation; retrying sequentially ($validationAttempt/${incrementalValidation.maxRetries})...")
+                            manifest = store.markPending(manifest, index, text)
+                            onManifest(manifest)
+                            continue
+                        }
+                        return BatchGenerationResult(
+                            BatchGenerationStatus.FAILED,
+                            manifest,
+                            completed,
+                            "Chunk $index validation failed after ${validationAttempt + 1} attempt(s): ${validation.message}",
+                            request.outputDirectory
+                        )
+                    }
+                    completed += BatchItemResult(index, text, request.outputDirectory.resolve(manifest.chunks.first { it.index == index }.fileName).toFile())
+                    onProgress(completed.size, texts.size)
+                    break
                 } catch (error: Throwable) {
                     commitPendingWrite()?.let { persistenceError ->
                         val currentError = markFailure(index, text, failureMessage(error))
                         return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, "$persistenceError; $currentError", request.outputDirectory)
                     }
+                    if (error is BatchManifestConflictException) {
+                        val current = runCatching { store.loadManifest() }.getOrDefault(manifest)
+                        return BatchGenerationResult(
+                            BatchGenerationStatus.FAILED,
+                            current,
+                            completed,
+                            "Manifest changed during validation or generation of chunk $index; reload and resume before retrying.",
+                            request.outputDirectory
+                        )
+                    }
+                    if (incrementalValidation != null && validationAttempt < incrementalValidation.maxRetries) {
+                        validationAttempt++
+                        onStatus("Chunk ${index + 1} generation failed; retrying sequentially ($validationAttempt/${incrementalValidation.maxRetries})...")
+                        manifest = store.markPending(manifest, index, text)
+                        onManifest(manifest)
+                        continue
+                    }
                     val message = markFailure(index, text, failureMessage(error))
                     return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, message, request.outputDirectory)
                 }
+                }
+            }
+            if (validationQueue == null) break
+            val queuedPolicy = incrementalValidation
+            val phaseResults = validationQueue.awaitPhase()
+            manifest = runCatching { store.loadManifest() }.getOrDefault(manifest)
+            val staleValidation = phaseResults.firstOrNull { it.stale }
+            if (staleValidation != null) {
+                return BatchGenerationResult(
+                    BatchGenerationStatus.FAILED,
+                    manifest,
+                    completed.sortedBy { it.index },
+                    "Manifest changed while queued validation was running for chunk ${staleValidation.chunkIndex}; reload and resume before retrying.",
+                    request.outputDirectory
+                )
+            }
+            val validationFailures = phaseResults.filterNot { it.passed }
+            if (validationFailures.isEmpty()) break
+
+            val exhausted = validationFailures.firstOrNull { failure ->
+                (queuedValidationAttempts[failure.chunkIndex] ?: 0) >= queuedPolicy.maxRetries
+            }
+            if (exhausted != null) {
+                val attempts = (queuedValidationAttempts[exhausted.chunkIndex] ?: 0) + 1
+                return BatchGenerationResult(
+                    BatchGenerationStatus.FAILED,
+                    runCatching { store.loadManifest() }.getOrDefault(manifest),
+                    completed.sortedBy { it.index },
+                    "Chunk ${exhausted.chunkIndex} validation failed after $attempts attempt(s): ${exhausted.message}",
+                    request.outputDirectory
+                )
+            }
+
+            val retryIndices = validationFailures.map { failure ->
+                queuedValidationAttempts[failure.chunkIndex] = (queuedValidationAttempts[failure.chunkIndex] ?: 0) + 1
+                val retryIndex = failure.chunkIndex
+                val retryText = texts[retryIndex]
+                manifest = store.markPending(manifest, retryIndex, retryText)
+                onManifest(manifest)
+                onStatus(
+                        "${validationFailures.size} queued chunk validation failure(s); " +
+                        "retrying chunk ${retryIndex + 1} sequentially " +
+                        "(${queuedValidationAttempts[retryIndex]}/${queuedPolicy.maxRetries})..."
+                )
+                retryIndex
+            }.toSet()
+            workIndices = retryIndices
             }
             commitPendingWrite()?.let { error ->
                 return BatchGenerationResult(BatchGenerationStatus.FAILED, manifest, completed, error, request.outputDirectory)
@@ -708,6 +1160,7 @@ class BatchGenerationSession(
                 outputDirectory = request.outputDirectory
             )
         } finally {
+            validationQueue?.close()
             persistenceExecutor.shutdownNow()
         }
     }
@@ -718,6 +1171,95 @@ class BatchGenerationSession(
         val future: Future<BatchChunk>,
         val alignmentSpans: List<BatchAlignmentSpan>? = null
     )
+
+    /**
+     * Re-generates a near-ceiling chunk in ordered sentence pieces.
+     *
+     * The native max-audio argument is per call, while the persisted chunk is
+     * the concatenation of every retry piece. Allocate each call from the
+     * remaining budget of the original chunk and reject a piece that reaches
+     * that allocation: reaching a ceiling is possible truncation, not a safe
+     * completion signal.
+     */
+    private fun generateSentenceBoundaryRetry(
+        original: QwenEngine.NativeResult,
+        parts: List<String>,
+        aggregateAudioTokens: Int,
+        aggregateAudioSamples: Long,
+        partAudioTokens: (String) -> Int,
+        generate: (String, Int) -> QwenEngine.NativeResult
+    ): QwenEngine.NativeResult {
+        require(parts.size >= 2) { "Sentence-boundary retry requires at least two parts." }
+        require(aggregateAudioTokens > 0) { "Aggregate audio-token budget must be positive." }
+        require(aggregateAudioSamples > 0) { "Aggregate audio-sample budget must be positive." }
+
+        val samplesPerAudioToken = aggregateAudioSamples.toDouble() / aggregateAudioTokens.toDouble()
+        var generatedSamples = 0L
+        val audioParts = ArrayList<FloatArray>(parts.size)
+        val generationTimes = ArrayList<Long>(parts.size)
+
+        parts.forEachIndexed { partIndex, partText ->
+            val remainingSamples = aggregateAudioSamples - generatedSamples
+            val remainingTokens = kotlin.math.floor(remainingSamples / samplesPerAudioToken).toInt()
+            val requestedTokens = minOf(partAudioTokens(partText), remainingTokens)
+            if (requestedTokens <= 0) {
+                error(
+                    "Sentence-boundary retry part $partIndex has no remaining audio budget " +
+                        "within the original chunk budget of $aggregateAudioTokens tokens / $aggregateAudioSamples samples."
+                )
+            }
+
+            val result = generate(partText, requestedTokens)
+            val audio = result.audio
+            if (!result.success || audio == null || audio.isEmpty()) {
+                error(
+                    "Sentence-boundary retry part $partIndex failed: " +
+                        (result.errorMsg ?: "Synthesis returned no audio.")
+                )
+            }
+            if (result.sampleRate != original.sampleRate) {
+                error(
+                    "Sentence-boundary retry part $partIndex returned sample rate ${result.sampleRate}; " +
+                        "expected ${original.sampleRate}."
+                )
+            }
+
+            val partSampleBudget = minOf(
+                remainingSamples,
+                kotlin.math.floor(requestedTokens * samplesPerAudioToken).toLong()
+            )
+            if (partSampleBudget <= 0L || audio.size.toLong() >= partSampleBudget) {
+                error(
+                    "Sentence-boundary retry part $partIndex reached its allocated audio budget " +
+                        "($requestedTokens tokens / $partSampleBudget samples); refusing possible truncation."
+                )
+            }
+
+            generatedSamples += audio.size.toLong()
+            if (generatedSamples >= aggregateAudioSamples) {
+                error(
+                    "Sentence-boundary retry exceeded the original chunk audio budget " +
+                        "($aggregateAudioTokens tokens / $aggregateAudioSamples samples)."
+                )
+            }
+            audioParts += audio
+            generationTimes += result.timeMs
+        }
+
+        val samples = FloatArray(audioParts.sumOf { it.size })
+        var offset = 0
+        audioParts.forEach { audio ->
+            audio.copyInto(samples, offset)
+            offset += audio.size
+        }
+        return QwenEngine.NativeResult(
+            audio = samples,
+            sampleRate = original.sampleRate,
+            success = true,
+            errorMsg = null,
+            timeMs = generationTimes.sum()
+        )
+    }
 
     private fun splitForAudioRetry(text: String): Pair<String, String>? {
         val candidates = Regex("(?<=[.!?。！？])\\s+").findAll(text).map { it.range.first + 1 }.toList()
